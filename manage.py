@@ -7,7 +7,6 @@ Run:      sdlc-telemetry
 from __future__ import annotations
 
 import json
-import os
 import sqlite3
 import subprocess
 import sys
@@ -42,51 +41,73 @@ def read_config() -> list[str]:
     if not CONFIG_FILE.exists():
         return []
     try:
-        return json.loads(CONFIG_FILE.read_text()).get("include_bases", [])
+        data = json.loads(CONFIG_FILE.read_text())
+        # support old key name
+        return data.get("include_dirs") or data.get("include_bases", [])
     except (json.JSONDecodeError, OSError):
         return []
 
-def write_config(bases: list[str]):
+def write_config(dirs: list[str]):
     DATA_DIR.mkdir(parents=True, exist_ok=True)
-    CONFIG_FILE.write_text(json.dumps({"include_bases": bases}, indent=2))
+    CONFIG_FILE.write_text(json.dumps({"include_dirs": dirs}, indent=2))
 
 # ── Project Discovery ──────────────────────────────────────
 
-def _display_name(dir_name: str) -> str:
-    username = os.environ.get("USER", "")
-    for prefix in (f"-Users-{username}-Code-", f"-Users-{username}-"):
-        if dir_name.startswith(prefix):
-            return dir_name[len(prefix):]
-    return dir_name
+def _peek_cwd(project_dir: Path) -> str | None:
+    """Return the cwd value from the first JSONL file in project_dir, or None."""
+    jsonl_files = sorted(project_dir.glob("*.jsonl"))
+    if not jsonl_files:
+        return None
+    try:
+        with jsonl_files[0].open() as f:
+            for _ in range(10):
+                line = f.readline()
+                if not line:
+                    break
+                try:
+                    obj = json.loads(line)
+                    cwd = obj.get("cwd")
+                    if cwd:
+                        return cwd
+                except json.JSONDecodeError:
+                    continue
+    except OSError:
+        pass
+    return None
 
-def get_project_groups() -> list[dict]:
-    """Identify base project dirs and their plugin variants."""
+def _display_from_cwd(cwd: str) -> str:
+    home = str(Path.home())
+    code_prefix = home + "/Code/"
+    if cwd.startswith(code_prefix):
+        return cwd[len(code_prefix):]
+    if cwd == home + "/Code":
+        return "~/Code"
+    if cwd.startswith(home + "/"):
+        return "~/" + cwd[len(home) + 1:]
+    if cwd == home:
+        return "~"
+    return cwd
+
+def get_project_list() -> list[dict]:
+    """Return dirs under ~/.claude/projects/ that contain JSONL session files."""
     if not PROJECTS_BASE.exists():
         return []
-    all_names = [d.name for d in sorted(PROJECTS_BASE.iterdir()) if d.is_dir()]
-    # Compare display names so that a home-dir encoding (-Users-username) can't
-    # absorb unrelated projects as "plugin variants".
-    display_of = {name: _display_name(name) for name in all_names}
-    all_displays = list(display_of.values())
-    groups = []
-    for name in all_names:
-        display = display_of[name]
-        if any(display != d and display.startswith(d + "-") for d in all_displays):
-            continue  # plugin variant — shown under its base
-        variants = sum(1 for d in all_displays if d.startswith(display + "-"))
-        groups.append({"name": name, "display": display, "variants": variants})
-    return groups
+    projects = []
+    for d in PROJECTS_BASE.iterdir():
+        if not d.is_dir():
+            continue
+        jsonl_count = sum(1 for _ in d.glob("*.jsonl"))
+        if jsonl_count == 0:
+            continue
+        cwd = _peek_cwd(d)
+        display = _display_from_cwd(cwd) if cwd else d.name
+        projects.append({"name": d.name, "display": display, "sessions": jsonl_count})
+    return sorted(projects, key=lambda p: p["display"].lower())
 
-def resolve_dirs(bases: list[str]) -> list[Path]:
-    """Expand base names to actual dirs including plugin variants."""
+def resolve_dirs(names: list[str]) -> list[Path]:
     if not PROJECTS_BASE.exists():
         return []
-    dirs = []
-    for base in bases:
-        for d in sorted(PROJECTS_BASE.iterdir()):
-            if d.is_dir() and (d.name == base or d.name.startswith(base + "-")):
-                dirs.append(d)
-    return dirs
+    return [PROJECTS_BASE / n for n in names if (PROJECTS_BASE / n).is_dir()]
 
 # ── Status ─────────────────────────────────────────────────
 
@@ -136,22 +157,19 @@ def show_header():
 # ── Actions ────────────────────────────────────────────────
 
 def action_configure():
-    groups = get_project_groups()
-    if not groups:
+    projects = get_project_list()
+    if not projects:
         console.print("[red]No projects found in ~/.claude/projects/[/red]")
         return
 
     current = set(read_config())
     choices = [
         questionary.Choice(
-            title=(
-                g["display"]
-                + (f"  (+{g['variants']} plugin dir(s))" if g["variants"] else "")
-            ),
-            value=g["name"],
-            checked=g["name"] in current,
+            title=f"{p['display']}  ({p['sessions']} sessions)",
+            value=p["name"],
+            checked=p["name"] in current,
         )
-        for g in groups
+        for p in projects
     ]
 
     selected = questionary.checkbox("Select projects to include:", choices=choices).ask()
