@@ -10,10 +10,11 @@ license = { text = "MIT" }
 requires-python = ">=3.9"
 dependencies = [
     "textual>=1.0,<9",
+    "pyfiglet>=1.0",
 ]
 
 [project.scripts]
-sdlc-telemetry = "manage:main"
+sdlc-t = "manage:main"
 
 [project.urls]
 Repository = "https://github.com/starfysh-tech/agentic-sdlc-telemetry"

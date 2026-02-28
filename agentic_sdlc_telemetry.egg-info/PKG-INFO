@@ -1,0 +1,11 @@
+Metadata-Version: 2.4
+Name: agentic-sdlc-telemetry
+Version: 0.2.1.dev1+gb1bcc7918.d20260228
+Summary: SDLC session analytics extraction for Claude Code
+License: MIT
+Project-URL: Repository, https://github.com/starfysh-tech/agentic-sdlc-telemetry
+Requires-Python: >=3.9
+License-File: LICENSE
+Requires-Dist: textual<9,>=1.0
+Requires-Dist: pyfiglet>=1.0
+Dynamic: license-file

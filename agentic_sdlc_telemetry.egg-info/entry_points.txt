@@ -1,0 +1,2 @@
+[console_scripts]
+sdlc-t = manage:main

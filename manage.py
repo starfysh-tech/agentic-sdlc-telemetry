@@ -2,7 +2,7 @@
 """agentic-sdlc-telemetry — management TUI
 
 Install:  pipx install git+https://github.com/starfysh-tech/agentic-sdlc-telemetry
-Run:      sdlc-telemetry
+Run:      sdlc-t
 """
 from __future__ import annotations
 
@@ -11,18 +11,22 @@ import os
 import sqlite3
 import sys
 import time
+import urllib.error
+import urllib.request
 from importlib.metadata import PackageNotFoundError
 from importlib.metadata import version as _pkg_version
 from pathlib import Path
 from subprocess import PIPE, STDOUT, Popen
 
+import pyfiglet
+from rich.text import Text
 from textual import work
 from textual.app import App, ComposeResult
 from textual.color import Color  # noqa: F401
 from textual.containers import Horizontal, Vertical
 from textual.reactive import reactive  # noqa: F401
 from textual.screen import ModalScreen, Screen
-from textual.widgets import Button, Footer, Header, Label, OptionList, RichLog, Static  # noqa: F401
+from textual.widgets import Button, DataTable, Footer, Header, Label, OptionList, RichLog, Static, TabbedContent, TabPane  # noqa: F401
 from textual.widgets import SelectionList
 from textual.widgets.selection_list import Selection
 
@@ -39,6 +43,7 @@ DB_FILE        = DATA_DIR / "sdlc_analytics.db"
 EXTRACT_SCRIPT = Path(__file__).parent / "sdlc_extract.py"
 PROJECTS_BASE  = Path.home() / ".claude" / "projects"
 PACKAGE_URL    = "git+https://github.com/starfysh-tech/agentic-sdlc-telemetry.git"
+GITHUB_API_URL = "https://api.github.com/repos/starfysh-tech/agentic-sdlc-telemetry/commits/main"
 
 # ── Config ─────────────────────────────────────────────────
 
@@ -168,21 +173,88 @@ def get_db_stats() -> dict:
     except sqlite3.Error:
         return {}
 
+def get_model_distribution() -> list[tuple]:
+    if not DB_FILE.exists():
+        return []
+    try:
+        with sqlite3.connect(DB_FILE) as conn:
+            total = conn.execute("SELECT COUNT(*) FROM sessions").fetchone()[0] or 1
+            rows = conn.execute("""
+                SELECT model, COUNT(*) as cnt FROM sessions
+                WHERE model IS NOT NULL
+                GROUP BY model ORDER BY cnt DESC
+            """).fetchall()
+            return [(m, c, f"{c/total*100:.1f}%") for m, c in rows]
+    except sqlite3.Error:
+        return []
+
+def get_monthly_sessions() -> list[tuple]:
+    if not DB_FILE.exists():
+        return []
+    try:
+        with sqlite3.connect(DB_FILE) as conn:
+            return conn.execute("""
+                SELECT substr(first_timestamp, 1, 7) as month, COUNT(*) as cnt
+                FROM sessions WHERE first_timestamp IS NOT NULL
+                GROUP BY month ORDER BY month DESC LIMIT 12
+            """).fetchall()
+    except sqlite3.Error:
+        return []
+
+def get_tool_usage() -> list[tuple]:
+    if not DB_FILE.exists():
+        return []
+    try:
+        with sqlite3.connect(DB_FILE) as conn:
+            return conn.execute("""
+                SELECT tool_name, SUM(call_count) as total
+                FROM session_tool_summary
+                GROUP BY tool_name ORDER BY total DESC LIMIT 30
+            """).fetchall()
+    except sqlite3.Error:
+        return []
+
+def get_git_summary() -> list[tuple]:
+    if not DB_FILE.exists():
+        return []
+    try:
+        with sqlite3.connect(DB_FILE) as conn:
+            return conn.execute("""
+                SELECT git_op_type, COUNT(*) as cnt
+                FROM git_operations
+                GROUP BY git_op_type ORDER BY cnt DESC
+            """).fetchall()
+    except sqlite3.Error:
+        return []
+
+def get_recent_commits(limit: int = 20) -> list[tuple]:
+    if not DB_FILE.exists():
+        return []
+    try:
+        with sqlite3.connect(DB_FILE) as conn:
+            return conn.execute("""
+                SELECT substr(g.timestamp, 1, 10),
+                       COALESCE(s.slug, s.git_branch, ''),
+                       COALESCE(g.commit_message, '')
+                FROM git_operations g
+                LEFT JOIN sessions s ON g.session_id = s.session_id
+                WHERE g.git_op_type = 'commit'
+                ORDER BY g.timestamp DESC LIMIT ?
+            """, (limit,)).fetchall()
+    except sqlite3.Error:
+        return []
+
 # ── TUI Widgets ────────────────────────────────────────────
 
 class AnimatedBanner(Static):
     DEFAULT_CSS = "AnimatedBanner { height: auto; padding: 1 2; text-align: center; }"
 
-    BANNER_LINES = [
-        "╔═╗ ╔╦╗ ╦  ╔═╗   ╔╦╗╔═╗╦  ╔═╗╔╦╗╔═╗╔╦╗╦═╗╦ ╦",
-        "╚═╗  ║║ ║  ║      ║ ║╣ ║  ║╣ ║║║║╣  ║ ╠╦╝╚╦╝",
-        "╚═╝ ═╩╝ ╩═╝╚═╝   ╩ ╚═╝╩═╝╚═╝╩ ╩╚═╝ ╩ ╩╚═ ╩ ",
-    ]
-    PALETTE = ["cyan", "dodgerblue", "mediumpurple", "magenta", "mediumpurple", "dodgerblue"]
+    PALETTE = ["#00ffff", "#1e90ff", "#9370db", "#ff00ff", "#9370db", "#1e90ff"]
 
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
         self._phase = 0
+        self._banner_lines = pyfiglet.figlet_format("SDLC TELEMETRY", font="small").splitlines()
 
     def on_mount(self) -> None:
         self._render_banner()
@@ -194,15 +266,14 @@ class AnimatedBanner(Static):
 
     def _render_banner(self) -> None:
         n = len(self.PALETTE)
-        lines = []
-        for line in self.BANNER_LINES:
-            colored = ""
+        text = Text()
+        for line_idx, line in enumerate(self._banner_lines):
+            if line_idx > 0:
+                text.append("\n")
             for i, ch in enumerate(line):
                 idx = (self._phase + i) % n
-                color = self.PALETTE[idx]
-                colored += f"[{color}]{ch}[/{color}]"
-            lines.append(colored)
-        self.update("\n".join(lines))
+                text.append(ch, style=self.PALETTE[idx])
+        self.update(text)
 
 
 class StatusSidebar(Static):
@@ -271,10 +342,11 @@ class ConfirmDialog(ModalScreen[bool]):
 
 
 class SubprocessScreen(Screen):
-    def __init__(self, cmd: list[str], title: str, *args, **kwargs) -> None:
+    def __init__(self, cmd: list[str], title: str, auto_pop: bool = False, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
         self._cmd = cmd
         self._title = title
+        self._auto_pop = auto_pop
         self._done = False
         self._proc: Popen | None = None
         self._start_time: float = 0.0
@@ -297,10 +369,8 @@ class SubprocessScreen(Screen):
         log = self.query_one(RichLog)
         sidebar = self.query_one(StatusSidebar)
 
-        try:
-            self.call_from_thread(sidebar.update, "Running...")
-        except Exception:
-            return
+        cft = self.app.call_from_thread
+        cft(sidebar.update, "Running...")
 
         try:
             proc = Popen(
@@ -315,7 +385,7 @@ class SubprocessScreen(Screen):
             if proc.stdout is not None:
                 for line in proc.stdout:
                     try:
-                        self.call_from_thread(log.write, line.rstrip())
+                        cft(log.write, line.rstrip())
                     except Exception:
                         break
 
@@ -323,27 +393,18 @@ class SubprocessScreen(Screen):
             elapsed = time.monotonic() - self._start_time
 
             if proc.returncode != 0:
-                try:
-                    self.call_from_thread(
-                        log.write,
-                        f"\n[red]Process exited with code {proc.returncode}[/red]",
-                    )
-                except Exception:
-                    pass
+                cft(log.write, f"\n[red]Process exited with code {proc.returncode}[/red]")
 
             status = f"{'Done' if proc.returncode == 0 else 'Failed'} ({elapsed:.1f}s)"
-            try:
-                self.call_from_thread(sidebar.update, status)
-                self.call_from_thread(log.write, "\nPress any key to return")
-            except Exception:
-                pass
+            cft(sidebar.update, status)
+            if self._auto_pop and proc.returncode == 0:
+                cft(self.app.pop_screen)
+                return
+            cft(log.write, "\nPress any key to return")
 
         except Exception as exc:
-            try:
-                self.call_from_thread(log.write, f"[red]Error: {exc}[/red]")
-                self.call_from_thread(log.write, "\nPress any key to return")
-            except Exception:
-                pass
+            cft(log.write, f"[red]Error: {exc}[/red]")
+            cft(log.write, "\nPress any key to return")
 
         self._done = True
 
@@ -355,6 +416,74 @@ class SubprocessScreen(Screen):
     def on_key(self) -> None:
         if self._done:
             self.app.pop_screen()
+
+
+class StatsScreen(Screen):
+    BINDINGS = [("escape", "app.pop_screen", "Back")]
+
+    def compose(self) -> ComposeResult:
+        yield AnimatedBanner()
+        with TabbedContent(initial="git"):
+            with TabPane("Git", id="git"):
+                with Vertical():
+                    yield Label("[bold] Git Operations[/bold]")
+                    yield DataTable(id="git-ops-table", cursor_type="row")
+                    yield Label("[bold] Recent Commits[/bold]")
+                    yield DataTable(id="commits-table", cursor_type="row")
+            with TabPane("Overview", id="overview"):
+                with Vertical():
+                    yield Static(id="overview-stats")
+                    yield Label("[bold] Model Distribution[/bold]")
+                    yield DataTable(id="model-table", cursor_type="row")
+                    yield Label("[bold] Sessions by Month[/bold]")
+                    yield DataTable(id="monthly-table", cursor_type="row")
+            with TabPane("Tools", id="tools"):
+                yield DataTable(id="tool-table", cursor_type="row")
+        yield Footer()
+
+    def on_mount(self) -> None:
+        self._populate_git()
+        self._populate_overview()
+        self._populate_tools()
+
+    def _populate_git(self) -> None:
+        ops_table = self.query_one("#git-ops-table", DataTable)
+        ops_table.add_columns("Type", "Count")
+        for git_type, cnt in get_git_summary():
+            ops_table.add_row(git_type, f"{cnt:,}")
+
+        commits_table = self.query_one("#commits-table", DataTable)
+        commits_table.add_columns("Date", "Branch", "Message")
+        for date, branch, msg in get_recent_commits():
+            commits_table.add_row(date or "", (branch or "")[:30], (msg or "")[:60])
+
+    def _populate_overview(self) -> None:
+        stats = get_db_stats()
+        if stats:
+            last = stats.get("last_run") or "never"
+            self.query_one("#overview-stats", Static).update(
+                f" [bold]{stats.get('main', 0):,}[/bold] main  "
+                f"[bold]{stats.get('sub', 0):,}[/bold] subagent  "
+                f"[bold]{stats.get('git_ops', 0):,}[/bold] git ops  "
+                f"[bold]{stats.get('prs', 0):,}[/bold] PRs  "
+                f"· Last extraction: {last}"
+            )
+
+        model_table = self.query_one("#model-table", DataTable)
+        model_table.add_columns("Model", "Sessions", "% Total")
+        for model, cnt, pct in get_model_distribution():
+            model_table.add_row(model or "unknown", f"{cnt:,}", pct)
+
+        monthly_table = self.query_one("#monthly-table", DataTable)
+        monthly_table.add_columns("Month", "Sessions")
+        for month, cnt in get_monthly_sessions():
+            monthly_table.add_row(month, f"{cnt:,}")
+
+    def _populate_tools(self) -> None:
+        tool_table = self.query_one("#tool-table", DataTable)
+        tool_table.add_columns("Tool", "Calls")
+        for tool, cnt in get_tool_usage():
+            tool_table.add_row(tool, f"{cnt:,}")
 
 
 class ConfigureScreen(Screen):
@@ -431,10 +560,13 @@ class ConfigureScreen(Screen):
 
 
 class DashboardScreen(Screen):
+    _push_stats_on_resume: bool = False
+
     BINDINGS = [
         ("r", "run", "Run"),
         ("c", "configure", "Configure"),
         ("u", "update", "Update"),
+        ("s", "stats", "Stats"),
         ("x", "uninstall", "Uninstall"),
         ("q", "quit_app", "Quit"),
     ]
@@ -447,6 +579,7 @@ class DashboardScreen(Screen):
                     "Run extraction",
                     "Configure projects",
                     "Update",
+                    "View stats",
                     "Uninstall",
                     id="menu",
                 )
@@ -459,12 +592,17 @@ class DashboardScreen(Screen):
 
     def on_screen_resume(self) -> None:
         self.query_one(StatusSidebar).refresh_stats()
+        if self._push_stats_on_resume:
+            self._push_stats_on_resume = False
+            if DB_FILE.exists():
+                self.app.push_screen(StatsScreen())
 
     def on_option_list_option_selected(self, event: OptionList.OptionSelected) -> None:
         actions = [
             self.action_run,
             self.action_configure,
             self.action_update,
+            self.action_stats,
             self.action_uninstall,
         ]
         if 0 <= event.option_index < len(actions):
@@ -486,14 +624,53 @@ class DashboardScreen(Screen):
             sys.executable, "-u", str(EXTRACT_SCRIPT), "-v",
             "--project-dirs", *[str(d) for d in dirs],
         ]
-        self.app.push_screen(SubprocessScreen(cmd, "Extraction"))
+        self._push_stats_on_resume = True
+        self.app.push_screen(SubprocessScreen(cmd, "Extraction", auto_pop=True))
 
     def action_configure(self) -> None:
         self.app.push_screen(ConfigureScreen())
 
     def action_update(self) -> None:
-        cmd = [sys.executable, "-m", "pip", "install", "--upgrade", PACKAGE_URL]
-        self.app.push_screen(SubprocessScreen(cmd, "Update"))
+        self.notify("Checking for updates...")
+        self._check_and_update()
+
+    @work(thread=True)
+    def _check_and_update(self) -> None:
+        cft = self.app.call_from_thread
+        local_sha: str | None = None
+        if "+g" in __version__:
+            local_sha = __version__.split("+g")[1][:7]
+        try:
+            req = urllib.request.Request(
+                GITHUB_API_URL,
+                headers={"Accept": "application/vnd.github.v3+json", "User-Agent": "sdlc-t"},
+            )
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                data = json.loads(resp.read())
+            remote_sha = data["sha"][:7]
+            if local_sha and local_sha == remote_sha:
+                cft(self.notify, f"Already on latest ({__version__})")
+                return
+            cft(self.notify, f"Update available ({remote_sha}), installing...")
+            proc = Popen(
+                [sys.executable, "-m", "pip", "install", "--upgrade", PACKAGE_URL],
+                stdout=PIPE, stderr=STDOUT, text=True,
+            )
+            proc.wait()
+            if proc.returncode == 0:
+                cft(self.notify, "Updated — restart sdlc-t to apply")
+            else:
+                cft(self.notify, "Update failed", severity="error")
+        except urllib.error.URLError as exc:
+            cft(self.notify, f"Network error: {exc}", severity="warning")
+        except Exception as exc:
+            cft(self.notify, f"Update check failed: {exc}", severity="error")
+
+    def action_stats(self) -> None:
+        if not DB_FILE.exists():
+            self.notify("No database yet — run extraction first.")
+            return
+        self.app.push_screen(StatsScreen())
 
     def action_uninstall(self) -> None:
         self.do_uninstall()
@@ -562,6 +739,31 @@ class SdlcApp(App):
         height: auto;
         margin-top: 1;
     }
+    StatsScreen TabbedContent {
+        height: 1fr;
+    }
+    StatsScreen DataTable {
+        margin-bottom: 1;
+    }
+    #git-ops-table {
+        height: 10;
+    }
+    #commits-table {
+        height: 1fr;
+    }
+    #model-table {
+        height: 10;
+    }
+    #monthly-table {
+        height: 8;
+    }
+    #tool-table {
+        height: 1fr;
+    }
+    #overview-stats {
+        height: auto;
+        padding: 1 0;
+    }
     """
 
     def on_mount(self) -> None:
@@ -572,7 +774,7 @@ class SdlcApp(App):
 def main() -> None:
     import argparse
     ap = argparse.ArgumentParser(
-        prog="sdlc-telemetry",
+        prog="sdlc-t",
         description="SDLC session analytics for Claude Code",
     )
     ap.add_argument("--version", action="version", version=f"%(prog)s {__version__}")

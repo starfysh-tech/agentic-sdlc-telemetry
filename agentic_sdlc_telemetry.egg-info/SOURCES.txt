@@ -1,0 +1,12 @@
+.gitignore
+LICENSE
+README.md
+manage.py
+pyproject.toml
+sdlc_extract.py
+agentic_sdlc_telemetry.egg-info/PKG-INFO
+agentic_sdlc_telemetry.egg-info/SOURCES.txt
+agentic_sdlc_telemetry.egg-info/dependency_links.txt
+agentic_sdlc_telemetry.egg-info/entry_points.txt
+agentic_sdlc_telemetry.egg-info/requires.txt
+agentic_sdlc_telemetry.egg-info/top_level.txt
