@@ -488,13 +488,6 @@ class SessionExtractor:
 # Entry Point
 # ============================================================
 
-_DEFAULT_DIRS = [
-    "-Users-randallnoval-Code-mqol-aerie",
-    "-Users-randallnoval-Code-mqol-aerie-feature-dev",
-    "-Users-randallnoval-Code-mqol-aerie-every-workflow",
-]
-
-
 def main():
     ap = argparse.ArgumentParser(description="SDLC Session Analytics Extractor")
     ap.add_argument("-v", "--verbose", action="store_true", help="Verbose progress output")
@@ -508,7 +501,7 @@ def main():
     )
     ap.add_argument(
         "--project-dirs", nargs="+", metavar="DIR",
-        help="Project directories to process (default: mqol-aerie variants)"
+        help="Project directories to process (default: all dirs in ~/.claude/projects/)"
     )
     args = ap.parse_args()
 
@@ -519,9 +512,7 @@ def main():
         project_dirs = [Path(d) for d in args.project_dirs]
     else:
         base = Path.home() / ".claude" / "projects"
-        project_dirs = [base / name for name in _DEFAULT_DIRS if (base / name).exists()]
-        if not project_dirs:
-            project_dirs = sorted(base.glob("*mqol-aerie*"))
+        project_dirs = sorted(d for d in base.iterdir() if d.is_dir()) if base.exists() else []
 
     if not project_dirs:
         print("ERROR: No project directories found.", file=sys.stderr)
