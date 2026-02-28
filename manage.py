@@ -64,12 +64,17 @@ def get_project_groups() -> list[dict]:
     if not PROJECTS_BASE.exists():
         return []
     all_names = [d.name for d in sorted(PROJECTS_BASE.iterdir()) if d.is_dir()]
+    # Compare display names so that a home-dir encoding (-Users-username) can't
+    # absorb unrelated projects as "plugin variants".
+    display_of = {name: _display_name(name) for name in all_names}
+    all_displays = list(display_of.values())
     groups = []
     for name in all_names:
-        if any(name != o and name.startswith(o + "-") for o in all_names):
+        display = display_of[name]
+        if any(display != d and display.startswith(d + "-") for d in all_displays):
             continue  # plugin variant — shown under its base
-        variants = sum(1 for o in all_names if o.startswith(name + "-"))
-        groups.append({"name": name, "display": _display_name(name), "variants": variants})
+        variants = sum(1 for d in all_displays if d.startswith(display + "-"))
+        groups.append({"name": name, "display": display, "variants": variants})
     return groups
 
 def resolve_dirs(bases: list[str]) -> list[Path]:
@@ -237,16 +242,19 @@ def _main_loop():
         show_header()
 
         choices = [
-            questionary.Choice("Run extraction",     value="run"),
-            questionary.Choice("Configure projects", value="config"),
-            questionary.Choice("Update",             value="update"),
+            questionary.Choice("[r] Run extraction",     value="run",       shortcut_key="r"),
+            questionary.Choice("[c] Configure projects", value="config",    shortcut_key="c"),
+            questionary.Choice("[u] Update",             value="update",    shortcut_key="u"),
             questionary.Separator(),
-            questionary.Choice("Uninstall",          value="uninstall"),
+            questionary.Choice("[x] Uninstall",          value="uninstall", shortcut_key="x"),
             questionary.Separator(),
-            questionary.Choice("Quit",               value="quit"),
+            questionary.Choice("[q] Quit",               value="quit",      shortcut_key="q"),
         ]
 
-        choice = questionary.select("What would you like to do?", choices=choices).ask()
+        choice = questionary.select(
+            "What would you like to do?  (↑↓ arrows, or press key)",
+            choices=choices,
+        ).ask()
 
         if choice is None or choice == "quit":
             break
