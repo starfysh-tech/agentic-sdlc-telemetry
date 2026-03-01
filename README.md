@@ -17,7 +17,7 @@ pip install git+https://github.com/starfysh-tech/agentic-sdlc-telemetry
 ## Usage
 
 ```bash
-sdlc-telemetry
+sdlc-t
 ```
 
 Launches an interactive TUI. On first run, use **Configure projects** to select which projects to include.
