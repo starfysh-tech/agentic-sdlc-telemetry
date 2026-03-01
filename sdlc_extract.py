@@ -88,6 +88,20 @@ CREATE INDEX IF NOT EXISTS idx_sessions_subagent  ON sessions(is_subagent);
 CREATE INDEX IF NOT EXISTS idx_git_ops_session    ON git_operations(session_id);
 CREATE INDEX IF NOT EXISTS idx_git_ops_type       ON git_operations(git_op_type);
 CREATE INDEX IF NOT EXISTS idx_pr_links_pr        ON pr_links(pr_number);
+
+CREATE TABLE IF NOT EXISTS session_events (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id  TEXT NOT NULL,
+    seq         INTEGER NOT NULL,
+    timestamp   TEXT,
+    tool_name   TEXT NOT NULL,
+    phase       TEXT NOT NULL,
+    duration_ms INTEGER,
+    detail      TEXT,
+    UNIQUE(session_id, seq)
+);
+CREATE INDEX IF NOT EXISTS idx_events_session ON session_events(session_id);
+CREATE INDEX IF NOT EXISTS idx_events_phase   ON session_events(phase);
 """
 
 
@@ -105,7 +119,7 @@ class DB:
         ).fetchone()
 
     def delete_session(self, session_id: str):
-        for table in ("sessions", "session_tool_summary", "git_operations", "pr_links"):
+        for table in ("session_tool_summary", "git_operations", "pr_links", "session_events", "sessions"):
             self.conn.execute(f"DELETE FROM {table} WHERE session_id = ?", (session_id,))
 
     def upsert_session(self, data: dict):
@@ -142,6 +156,16 @@ class DB:
                  lnk.get("pr_repository"), lnk.get("timestamp"))
                 for lnk in links
             ],
+        )
+
+    def insert_events(self, events: list[dict]) -> None:
+        if not events:
+            return
+        self.conn.executemany(
+            "INSERT OR REPLACE INTO session_events "
+            "(session_id, seq, timestamp, tool_name, phase, duration_ms, detail) "
+            "VALUES (:session_id, :seq, :timestamp, :tool_name, :phase, :duration_ms, :detail)",
+            events,
         )
 
     def update_facets(self, session_id: str, facets_json: str):
@@ -217,6 +241,70 @@ class GitOpExtractor:
             "commit_message": commit_message,
             "branch_name": branch_name,
         }
+
+
+# ============================================================
+# Phase Classification
+# ============================================================
+
+_DISCOVER = frozenset({
+    "WebSearch", "WebFetch", "ListMcpResourcesTool", "ReadMcpResourceTool",
+})
+
+_PLAN = frozenset({
+    "AskUserQuestion", "EnterPlanMode", "ExitPlanMode", "TodoWrite", "TodoRead",
+    "TaskCreate", "TaskList", "TaskGet", "TaskUpdate", "TeamCreate", "TeamDelete",
+    "SendMessage",
+})
+
+_DELIVER_RE = re.compile(
+    r"git\s+push|gh\s+pr\s+(create|merge)|heroku\s+deploy|vercel\s+deploy|kubectl\s+apply",
+    re.IGNORECASE,
+)
+_TEST_RE = re.compile(
+    r"pytest|jest|npm\s+test|yarn\s+test|pnpm\s+test|rspec|go\s+test|cargo\s+test"
+    r"|phpunit|mvn\s+test|gradle\s+test|\.test\.\w+|_test\.py|spec\.\w+",
+    re.IGNORECASE,
+)
+_REVIEW_RE = re.compile(r"gh\s+pr\s+(review|comment|view)\b", re.IGNORECASE)
+
+
+def classify_tool(tool_name: str, tool_input: dict) -> str:
+    """Map a tool call to an SDLC phase. Priority: Test > Review > Deliver > Plan > Discover > Code."""
+    inp = tool_input or {}
+    if tool_name == "Bash":
+        cmd = inp.get("command", "")
+        if _TEST_RE.search(cmd):
+            return "Test"
+        if _REVIEW_RE.search(cmd):
+            return "Review"
+        if _DELIVER_RE.search(cmd):
+            return "Deliver"
+    if tool_name in {"Agent", "Skill"}:
+        return "Review"
+    if tool_name in _PLAN:
+        return "Plan"
+    if tool_name in _DISCOVER:
+        return "Discover"
+    return "Code"
+
+
+def extract_detail(tool_name: str, tool_input: dict) -> str | None:
+    """Extract a short human-readable detail string from a tool call."""
+    inp = tool_input or {}
+    if tool_name in ("Read", "Write", "Edit", "MultiEdit", "NotebookRead", "NotebookEdit"):
+        path = inp.get("file_path") or inp.get("notebook_path")
+        return Path(path).name if path else None
+    if tool_name in ("Glob", "Grep"):
+        return (inp.get("pattern") or "")[:100] or None
+    if tool_name == "Bash":
+        cmd = inp.get("command", "")
+        return cmd[:100] if cmd else None
+    if tool_name == "WebSearch":
+        return (inp.get("query") or "")[:100] or None
+    if tool_name == "WebFetch":
+        return (inp.get("url") or "")[:100] or None
+    return None
 
 
 # ============================================================
@@ -318,6 +406,9 @@ class SessionExtractor:
         tools: dict[str, int] = defaultdict(int)
         git_ops: list = []
         pr_links: list = []
+        events: list[dict] = []
+        pending_tools: dict[str, dict] = {}  # tool_use_id → {name, ts_ms, input, seq}
+        event_seq = 0
 
         for etype, ev in self.parser.parse(filepath):
             # Timestamp from event or snapshot sub-object
@@ -352,6 +443,28 @@ class SessionExtractor:
                     extracted = _first_text(msg.get("content"))
                     if extracted:
                         first_user_msg = extracted
+                if isinstance(msg.get("content"), list):
+                    for block in msg["content"]:
+                        if not isinstance(block, dict) or block.get("type") != "tool_result":
+                            continue
+                        tool_id = block.get("tool_use_id")
+                        if not tool_id:
+                            continue
+                        pending = pending_tools.pop(tool_id, None)
+                        if pending is None:
+                            continue
+                        start_ms = pending["ts_ms"]
+                        end_ms = _ts_ms(ts)
+                        duration_ms = (end_ms - start_ms) if (start_ms and end_ms) else None
+                        events.append({
+                            "session_id": session_id,
+                            "seq": pending["seq"],
+                            "timestamp": ts,
+                            "tool_name": pending["name"],
+                            "phase": classify_tool(pending["name"], pending["input"]),
+                            "duration_ms": duration_ms,
+                            "detail": extract_detail(pending["name"], pending["input"]),
+                        })
 
             elif etype == "assistant":
                 msg = ev.get("message") or {}
@@ -373,6 +486,15 @@ class SessionExtractor:
                         continue
                     name = block.get("name", "unknown")
                     tools[name] += 1
+                    tool_use_id = block.get("id")
+                    if tool_use_id:
+                        event_seq += 1
+                        pending_tools[tool_use_id] = {
+                            "name": name,
+                            "ts_ms": _ts_ms(ts),
+                            "input": block.get("input") or {},
+                            "seq": event_seq,
+                        }
                     if name == "Bash":
                         cmd = (block.get("input") or {}).get("command", "")
                         if cmd:
@@ -390,6 +512,17 @@ class SessionExtractor:
                     "pr_repository": ev.get("prRepository"),
                     "timestamp": ev.get("timestamp"),
                 })
+
+        for pending in pending_tools.values():
+            events.append({
+                "session_id": session_id,
+                "seq": pending["seq"],
+                "timestamp": None,
+                "tool_name": pending["name"],
+                "phase": classify_tool(pending["name"], pending["input"]),
+                "duration_ms": None,
+                "detail": extract_detail(pending["name"], pending["input"]),
+            })
 
         duration_ms = (
             (_ts_ms(last_ts) - _ts_ms(first_ts)) if first_ts and last_ts else None
@@ -418,15 +551,18 @@ class SessionExtractor:
             "file_size_bytes": size,
             "file_mtime": mtime,
         }
-        return {"session": session, "tools": dict(tools), "git_ops": git_ops, "pr_links": pr_links}
+        return {"session": session, "tools": dict(tools), "git_ops": git_ops, "pr_links": pr_links, "events": events}
 
-    def run(self, project_dirs: list, full: bool = False) -> dict:
+    def run(self, project_dirs: list, full: bool = False, on_progress=None) -> dict:
         files = self.discover_files(project_dirs)
         total = len(files)
         processed = skipped = errors = 0
 
         if self.verbose:
             print(f"Discovered {total} JSONL files", file=sys.stderr)
+
+        if on_progress:
+            on_progress(0, total)
 
         for i, (fp, is_sub, parent_id) in enumerate(files):
             try:
@@ -447,10 +583,14 @@ class SessionExtractor:
                         self.db.insert_git_ops(result["git_ops"])
                     if result["pr_links"]:
                         self.db.insert_pr_links(result["pr_links"])
+                    if result["events"]:
+                        self.db.insert_events(result["events"])
                     processed += 1
 
                 if (i + 1) % 50 == 0:
                     self.db.commit()
+                    if on_progress:
+                        on_progress(i + 1, total)
                     if self.verbose:
                         print(f"  [{i+1}/{total}] {processed} processed, {skipped} skipped",
                               file=sys.stderr)
@@ -461,6 +601,8 @@ class SessionExtractor:
                     print(f"  ERROR {fp}: {e}", file=sys.stderr)
 
         self.db.commit()
+        if on_progress:
+            on_progress(total, total)
         if self.verbose:
             print(f"Done: {processed} processed, {skipped} unchanged, {errors} errors",
                   file=sys.stderr)
