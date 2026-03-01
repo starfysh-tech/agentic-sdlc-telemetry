@@ -198,6 +198,63 @@ def _fmt_tokens(n: int | None) -> str:
         return f"{n / 1_000:.1f}K"
     return str(n)
 
+# ── Metric Thresholds (good, warn) ────────────────────────
+_THRESH = {
+    "prs_week":       (5, 2),      # higher-is-better
+    "commits_day":    (3, 1),      # higher-is-better
+    "lead_time_h":    (4, 24),     # lower-is-better
+    "push_rate_pct":  (60, 40),    # higher-is-better (percentage scale)
+    "productivity":   (40, 20),    # higher-is-better
+    "unproductive_h": (0.17, 1),   # lower-is-better (<10m green, >1h red)
+}
+
+def _threshold_color(val, good, warn, *, lower_is_better=False) -> str:
+    """Return hex color for metric value. None → empty string (no color)."""
+    if val is None:
+        return ""
+    if lower_is_better:
+        if val <= good: return "#00ff7f"
+        if val <= warn: return "#ffa500"
+        return "#ff5555"
+    else:
+        if val >= good: return "#00ff7f"
+        if val >= warn: return "#ffa500"
+        return "#ff5555"
+
+def _colored(val_str: str, color: str) -> str:
+    """Wrap val_str in bold+color markup, or plain bold if color is empty."""
+    if color:
+        return f"[bold {color}]{val_str}[/]"
+    return f"[bold]{val_str}[/bold]"
+
+def _lead_time_clamp_color(lead_h):
+    """Return (clamped_hours, color) for a lead time value in hours."""
+    clamped = max(lead_h, 0) if lead_h is not None else None
+    color = _threshold_color(clamped, *_THRESH["lead_time_h"], lower_is_better=True)
+    return clamped, color
+
+def _phase_cell(phase: str) -> Text:
+    """Return a Text cell with phase name styled using _PHASE_COLORS."""
+    color = _PHASE_COLORS.get(phase, "")
+    return Text(phase, style=f"bold {color}" if color else "")
+
+def _fmt_relative_time(iso_str: str | None) -> str:
+    if not iso_str:
+        return "[dim]never[/dim]"
+    from datetime import datetime, timezone
+    try:
+        ts = str(iso_str)  # guard against non-string input
+        dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        s = int((datetime.now(timezone.utc) - dt).total_seconds())
+        if s < 60:    return "just now"
+        if s < 3600:  return f"{s // 60}m ago"
+        if s < 86400: return f"{s // 3600}h ago"
+        return f"{s // 86400}d ago"
+    except (ValueError, TypeError, AttributeError):
+        return str(iso_str)[:19]
+
 def get_velocity_banner() -> dict:
     if not DB_FILE.exists():
         return {}
@@ -731,7 +788,7 @@ class StatusSidebar(Static):
                 f"   [bold]{stats.get('git_ops', 0):,}[/bold] ops\n"
                 f"   [bold]{stats.get('prs', 0):,}[/bold] PRs\n"
                 f" Last Run\n"
-                f"   {stats.get('last_run') or '[dim]never[/dim]'}\n"
+                f"   {_fmt_relative_time(stats.get('last_run'))}\n"
                 f" Projects\n"
                 f"   {len(cfg)} configured\n"
                 f"   {len(projects)} available\n"
@@ -862,24 +919,24 @@ class StatsScreen(Screen):
                 with Vertical():
                     yield Static(id="velocity-banner")
                     yield Label("[bold] Weekly Throughput[/bold]")
-                    yield DataTable(id="weekly-throughput-table", cursor_type="row")
+                    yield DataTable(id="weekly-throughput-table", cursor_type="row", zebra_stripes=True)
                     yield Label("[bold] Recent PRs[/bold]")
-                    yield DataTable(id="recent-prs-table", cursor_type="row")
+                    yield DataTable(id="recent-prs-table", cursor_type="row", zebra_stripes=True)
             with TabPane("Lead Time", id="lead-time"):
                 with Vertical():
                     yield Label("[bold] PR Lifecycle[/bold]")
-                    yield DataTable(id="pr-lifecycle-table", cursor_type="row")
+                    yield DataTable(id="pr-lifecycle-table", cursor_type="row", zebra_stripes=True)
                     yield Label("[bold] Rework Hotspots[/bold]")
-                    yield DataTable(id="rework-table", cursor_type="row")
+                    yield DataTable(id="rework-table", cursor_type="row", zebra_stripes=True)
             with TabPane("Efficiency", id="efficiency"):
                 with Vertical():
                     yield Static(id="efficiency-banner")
                     yield Label("[bold] Model Comparison[/bold]")
                     yield DataTable(id="model-efficiency-table", cursor_type="row")
                     yield Label("[bold] Unproductive Sessions[/bold]")
-                    yield DataTable(id="unproductive-table", cursor_type="row")
+                    yield DataTable(id="unproductive-table", cursor_type="row", zebra_stripes=True)
                     yield Label("[bold] Tool Usage[/bold]")
-                    yield DataTable(id="tool-usage-table", cursor_type="row")
+                    yield DataTable(id="tool-usage-table", cursor_type="row", zebra_stripes=True)
             with TabPane("Value Stream", id="value-stream"):
                 with Vertical():
                     yield Static(id="vs-info-banner")
@@ -900,17 +957,28 @@ class StatsScreen(Screen):
 
     def _populate_throughput(self) -> None:
         v = get_velocity_banner()
+        prs = v.get("prs_week", 0)
+        cpd = v.get("commits_day", 0)
+        lt = v.get("avg_lead_time_h")
+        pr_pct = v.get("push_rate", 0) * 100
+
+        c_prs = _threshold_color(prs, *_THRESH["prs_week"])
+        c_cpd = _threshold_color(cpd, *_THRESH["commits_day"])
+        c_lt  = _threshold_color(lt, *_THRESH["lead_time_h"], lower_is_better=True)
+        c_pr  = _threshold_color(pr_pct, *_THRESH["push_rate_pct"])
+
         self.query_one("#velocity-banner", Static).update(
-            f" PRs/week [bold]{v.get('prs_week', 0)}[/bold]"
-            f"  ·  Commits/day [bold]{v.get('commits_day', 0):.1f}[/bold]"
-            f"  ·  Avg lead time [bold]{v.get('avg_lead_time_h', 0):.1f}h[/bold]"
-            f"  ·  Push rate [bold]{v.get('push_rate', 0) * 100:.1f}%[/bold]"
+            f" PRs/week {_colored(str(prs), c_prs)}"
+            f"  ·  Commits/day {_colored(f'{cpd:.1f}', c_cpd)}"
+            f"  ·  Avg lead time {_colored(f'{lt or 0:.1f}h', c_lt)}"
+            f"  ·  Push rate {_colored(f'{pr_pct:.1f}%', c_pr)}"
         )
         wt = self.query_one("#weekly-throughput-table", DataTable)
         wt.add_columns("Week", "PRs Created", "PRs Merged", "Commits", "Lead Time (avg)")
         for week, prs_c, prs_m, commits, lead_h in get_weekly_throughput():
-            wt.add_row(week, str(prs_c), str(prs_m), str(commits),
-                       f"{lead_h:.1f}h" if lead_h else "—")
+            lead_h_clamped, c = _lead_time_clamp_color(lead_h)
+            lead_cell = Text(f"{lead_h_clamped:.1f}h" if lead_h_clamped is not None else "—", style=f"bold {c}" if c else "")
+            wt.add_row(week, str(prs_c), str(prs_m), str(commits), lead_cell)
         rt = self.query_one("#recent-prs-table", DataTable)
         rt.add_columns("Date", "PR#", "Repository", "Branch")
         for date, pr_num, repo, branch in get_recent_prs():
@@ -921,7 +989,9 @@ class StatsScreen(Screen):
         lc = self.query_one("#pr-lifecycle-table", DataTable)
         lc.add_columns("Branch", "Lead Time", "Sessions", "Commits", "First Session", "PR Created")
         for branch, lead_h, sessions, commits, first_s, pr_c in get_pr_lifecycle():
-            lc.add_row((branch or "")[:40], _fmt_duration((lead_h or 0) * 3600),
+            lead_h_clamped, c = _lead_time_clamp_color(lead_h)
+            lead_cell = Text(_fmt_duration(lead_h_clamped * 3600) if lead_h_clamped is not None else "—", style=f"bold {c}" if c else "")
+            lc.add_row((branch or "")[:40], lead_cell,
                        str(sessions), str(commits), first_s or "", pr_c or "")
         rw = self.query_one("#rework-table", DataTable)
         rw.add_columns("Branch", "Sessions", "Commits", "Total Duration", "Commits/Session")
@@ -931,8 +1001,10 @@ class StatsScreen(Screen):
 
     def _populate_efficiency(self) -> None:
         e = get_efficiency_metrics()
+        prod = e.get('productivity_rate', 0)
+        c_prod = _threshold_color(prod, *_THRESH["productivity"])
         self.query_one("#efficiency-banner", Static).update(
-            f" Productivity [bold]{e.get('productivity_rate', 0):.0f}%[/bold]"
+            f" Productivity {_colored(f'{prod:.0f}%', c_prod)}"
             f"  ·  Tokens/commit [bold]{_fmt_tokens(int(e.get('tokens_per_commit', 0)))}[/bold]"
             f"  ·  Avg session [bold]{_fmt_duration(e.get('avg_duration_s', 0))}[/bold]"
             f"  ·  Subagent ratio [bold]{e.get('subagent_ratio', 0):.1f}x[/bold]"
@@ -945,12 +1017,21 @@ class StatsScreen(Screen):
         ut = self.query_one("#unproductive-table", DataTable)
         ut.add_columns("Date", "Duration", "Model", "First Prompt")
         for date, dur_s, model, prompt in get_unproductive_sessions():
-            ut.add_row(date or "", _fmt_duration(dur_s), model or "unknown",
+            dur_h = (dur_s / 3600) if dur_s is not None else None
+            c = _threshold_color(dur_h, *_THRESH["unproductive_h"], lower_is_better=True)
+            dur_cell = Text(_fmt_duration(dur_s), style=f"bold {c}" if c else "")
+            ut.add_row(date or "", dur_cell, model or "unknown",
                        (prompt or "")[:80])
         tt = self.query_one("#tool-usage-table", DataTable)
         tt.add_columns("Tool", "Total Calls", "Sessions", "Avg/Session")
-        for tool, total, session_cnt, avg in get_tool_usage_enhanced():
-            tt.add_row(tool, f"{total:,}", f"{session_cnt:,}", f"{avg:.1f}")
+        for i, (tool, total, session_cnt, avg) in enumerate(get_tool_usage_enhanced()):
+            if i < 3:
+                style = "bold"
+            elif i < 10:
+                style = ""
+            else:
+                style = "dim"
+            tt.add_row(Text(tool, style=style), f"{total:,}", f"{session_cnt:,}", f"{avg:.1f}")
 
 
     def _populate_value_stream(self) -> None:
@@ -969,7 +1050,7 @@ class StatsScreen(Screen):
 
         for p in sorted(phases, key=lambda x: _PHASE_ORDER.index(x["phase"]) if x["phase"] in _PHASE_ORDER else 99):
             tools_str = ", ".join(t[0] for t in p["top_tools"][:3])
-            pt.add_row(p["phase"], f"{p['total_calls']:,}", f"{p['time_pct']}%",
+            pt.add_row(_phase_cell(p["phase"]), f"{p['total_calls']:,}", f"{p['time_pct']}%",
                        f"{p['session_count']:,}", tools_str)
 
         sessions = get_recent_sessions_for_select()
@@ -992,7 +1073,7 @@ class StatsScreen(Screen):
         bar.update(render_phase_bar(phases))
         for p in sorted(phases, key=lambda x: _PHASE_ORDER.index(x["phase"]) if x["phase"] in _PHASE_ORDER else 99):
             tools_str = ", ".join(t[0] for t in p["top_tools"][:3])
-            table.add_row(p["phase"], f"{p['total_calls']:,}", f"{p['time_pct']}%", tools_str)
+            table.add_row(_phase_cell(p["phase"]), f"{p['total_calls']:,}", f"{p['time_pct']}%", tools_str)
 
 
 class ConfigureScreen(Screen):
@@ -1294,7 +1375,9 @@ class SdlcApp(App):
     }
     #velocity-banner, #efficiency-banner {
         height: auto;
-        padding: 1 0;
+        padding: 1 2;
+        background: $surface;
+        border-bottom: solid $accent;
     }
     #weekly-throughput-table {
         height: 12;
