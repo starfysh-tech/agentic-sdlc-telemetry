@@ -22,6 +22,13 @@ sdlc-t
 
 Launches an interactive TUI. On first run, use **Configure projects** to select which projects to include.
 
+Stats support two scopes:
+
+- **All Activity** (default) — includes main + subagent sessions
+- **Delivery Only** — includes only main sessions
+
+Stats now include a **PR Commit Timing** view with pre-vs-post PR-open commit counts, post-open ratio, and confidence bands.
+
 ## Menu
 
 | Option | Description |
@@ -44,6 +51,25 @@ Data is stored in `~/.claude/usage-data/sdlc-analytics/sdlc_analytics.db`.
 
 Extraction is incremental — files are skipped if size and mtime haven't changed since the last run.
 
+## GitHub PR Enrichment
+
+Use enrichment to fill PR lifecycle truth data and PR commit timing truth:
+
+- PR metadata (`opened_at`, `merged_at`, branches, status, `merge_commit_sha`)
+- Final PR commit set (`/pulls/{n}/commits`)
+- PR timeline commit-added events (`/issues/{n}/timeline`)
+
+```bash
+GITHUB_TOKEN=... python3 sdlc_extract.py --enrich-only
+```
+
+Common backfill flow after schema upgrades:
+
+```bash
+python3 sdlc_extract.py --full
+GITHUB_TOKEN=... python3 sdlc_extract.py --enrich-only
+```
+
 ## Database schema
 
 ```
@@ -51,8 +77,26 @@ sessions             — one row per JSONL file (main + subagent)
 session_tool_summary — tool call counts per session
 git_operations       — git commits, branches, pushes extracted from sessions
 pr_links             — pull request URLs linked to sessions
+pr_facts             — GitHub PR truth data (opened/closed/merged timestamps, branches, merge SHA, state)
+pr_commits_final     — final commit set currently attached to each PR
+pr_commit_events     — GitHub timeline commit-added events for PRs
+session_events       — per-tool timeline events with SDLC phase classification
 extraction_meta      — key/value store (last_run timestamp, etc.)
 ```
+
+## Confidence
+
+PR-derived metrics include confidence based on PR linkage coverage:
+
+- `HIGH` >= 90%
+- `MED` >= 70%
+- `LOW` < 70%
+
+PR Commit Timing metrics use an additional per-PR confidence:
+
+- `HIGH`: timeline commit events + `opened_at`
+- `MED`: fallback to final commit timestamps + `opened_at`
+- `LOW`: incomplete metadata (excluded from ratio aggregates)
 
 ## Requirements
 
