@@ -31,23 +31,71 @@ Stats now include a **PR Commit Timing** view with pre-vs-post PR-open commit co
 
 ### CLI Mode (for automation/AI)
 
-Use `--cli` to emit JSON instead of launching the TUI:
+Use `--ai` to run non-interactive JSON commands (optimized for agent consumption):
 
 ```bash
-sdlc-t --cli
+sdlc-t --ai --command stats
 ```
 
-Filter by scope and one or more repos:
+Every response is a stable JSON envelope:
+
+```json
+{
+  "ok": true,
+  "command": "stats",
+  "generated_at": "2026-03-03T00:00:00+00:00",
+  "data": {},
+  "errors": [],
+  "warnings": []
+}
+```
+
+Common commands:
 
 ```bash
-sdlc-t --cli --scope delivery_only --repo mqol-inc/aerie --repo starfysh-tech/cc-hooks-metrics --limit 20
+# TUI parity stats payload + repo snapshot
+sdlc-t --ai --command stats --scope all_activity --limit 20
+
+# DB/config status
+sdlc-t --ai --command status
+
+# List discovered projects under ~/.claude/projects
+sdlc-t --ai --command projects.list
+
+# Get configured include dirs
+sdlc-t --ai --command config.get
+
+# Set configured projects by project name/display
+sdlc-t --ai --command config.set --project my-project --project org/repo
+
+# Run extraction (incremental by default)
+sdlc-t --ai --command extract.run
+
+# Run full extraction + GitHub enrichment
+sdlc-t --ai --command extract.run --full --enrich --github-token-env GITHUB_TOKEN --github-max-prs 500
+
+# Check/update package
+sdlc-t --ai --command update.check
+sdlc-t --ai --command update.apply
+
+# Uninstall config (+ optional DB)
+sdlc-t --ai --command uninstall --yes
+sdlc-t --ai --command uninstall --yes --remove-db
+```
+
+Repo filtering for stats/rework analytics:
+
+```bash
+sdlc-t --ai --command stats --scope delivery_only --repo mqol-inc/aerie --repo starfysh-tech/cc-hooks-metrics --limit 20
 ```
 
 Compact JSON output:
 
 ```bash
-sdlc-t --cli --compact
+sdlc-t --ai --command stats --compact
 ```
+
+`--cli` remains as a legacy alias for AI mode.
 
 ## Menu
 
