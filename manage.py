@@ -1647,7 +1647,7 @@ class StatsScreen(Screen):
         phases = get_session_pipeline(session_id)
         bar = self.query_one("#session-phase-bar", Static)
         table = self.query_one("#session-phase-table", DataTable)
-        table.clear()
+        self._prepare_table(table, ("Phase", "Calls", "Time %", "Top Tools"))
 
         if not phases:
             bar.update("[dim]No events for this session.[/dim]")
