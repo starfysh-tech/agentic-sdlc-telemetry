@@ -22,6 +22,11 @@ sdlc-t
 
 Launches an interactive TUI. On first run, use **Configure projects** to select which projects to include.
 
+The tool is self-contained under `sdlc-t`:
+
+- TUI mode: `sdlc-t`
+- AI/automation mode: `sdlc-t --ai --command ...`
+
 Stats support two scopes:
 
 - **All Activity** (default) — includes main + subagent sessions
@@ -29,7 +34,7 @@ Stats support two scopes:
 
 Stats now include a **PR Commit Timing** view with pre-vs-post PR-open commit counts, post-open ratio, and confidence bands.
 
-### CLI Mode (for automation/AI)
+### AI Command Mode (for automation/AI)
 
 Use `--ai` to run non-interactive JSON commands (optimized for agent consumption):
 
@@ -49,6 +54,12 @@ Every response is a stable JSON envelope:
   "warnings": []
 }
 ```
+
+Output is optimized for machine consumption:
+
+- no interactive prompts in AI mode
+- stable top-level keys (`ok`, `command`, `generated_at`, `data`, `errors`, `warnings`)
+- deterministic JSON with optional `--compact`
 
 Common commands:
 
@@ -82,6 +93,17 @@ sdlc-t --ai --command update.apply
 sdlc-t --ai --command uninstall --yes
 sdlc-t --ai --command uninstall --yes --remove-db
 ```
+
+TUI action parity via `sdlc-t --ai --command`:
+
+| TUI Action | AI Command |
+|---|---|
+| Run extraction | `extract.run` |
+| Configure projects | `config.get`, `config.set`, `projects.list` |
+| View stats | `stats` |
+| Update | `update.check`, `update.apply` |
+| Uninstall | `uninstall` |
+| Dashboard status | `status` |
 
 Repo filtering for stats/rework analytics:
 
@@ -128,15 +150,16 @@ Use enrichment to fill PR lifecycle truth data and PR commit timing truth:
 - PR timeline commit-added events (`/issues/{n}/timeline`)
 
 ```bash
-GITHUB_TOKEN=... python3 sdlc_extract.py --enrich-only
+sdlc-t --ai --command extract.run --enrich --github-token-env GITHUB_TOKEN
 ```
 
 Common backfill flow after schema upgrades:
 
 ```bash
-python3 sdlc_extract.py --full
-GITHUB_TOKEN=... python3 sdlc_extract.py --enrich-only
+sdlc-t --ai --command extract.run --full --enrich --github-token-env GITHUB_TOKEN
 ```
+
+Direct script usage still works, but `sdlc-t` is the preferred self-contained interface.
 
 ## Database schema
 
