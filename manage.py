@@ -17,10 +17,11 @@ from importlib.metadata import PackageNotFoundError
 from importlib.metadata import version as _pkg_version
 from pathlib import Path
 from subprocess import PIPE, STDOUT, Popen
+from typing import Literal
 
 import pyfiglet
 from rich.text import Text
-from sdlc_extract import DB as ExtractDB, SessionExtractor
+from sdlc_extract import DB as ExtractDB, SCHEMA_VERSION, SessionExtractor
 from textual import work
 from textual.app import App, ComposeResult
 from textual.color import Color  # noqa: F401
@@ -45,6 +46,7 @@ EXTRACT_SCRIPT = Path(__file__).parent / "sdlc_extract.py"
 PROJECTS_BASE  = Path.home() / ".claude" / "projects"
 PACKAGE_URL    = "git+https://github.com/starfysh-tech/agentic-sdlc-telemetry.git"
 GITHUB_API_URL = "https://api.github.com/repos/starfysh-tech/agentic-sdlc-telemetry/commits/main"
+Scope = Literal["all_activity", "delivery_only"]
 
 # ── Config ─────────────────────────────────────────────────
 
@@ -255,232 +257,641 @@ def _fmt_relative_time(iso_str: str | None) -> str:
     except (ValueError, TypeError, AttributeError):
         return str(iso_str)[:19]
 
-def get_velocity_banner() -> dict:
+
+def _scope_clause(scope: Scope, alias: str = "s") -> str:
+    if scope == "delivery_only":
+        return f"{alias}.is_subagent = 0"
+    return "1=1"
+
+
+def _confidence_label(numerator: int, denominator: int) -> str:
+    if denominator <= 0:
+        return "LOW"
+    pct = numerator / denominator
+    if pct >= 0.90:
+        return "HIGH"
+    if pct >= 0.70:
+        return "MED"
+    return "LOW"
+
+
+def _confidence_style(label: str) -> str:
+    if label == "HIGH":
+        return "bold #00ff7f"
+    if label == "MED":
+        return "bold #ffa500"
+    return "bold #ff5555"
+
+
+def _scope_label(scope: Scope) -> str:
+    return "All Activity" if scope == "all_activity" else "Delivery Only"
+
+
+def _scoped_pr_urls(scope: Scope) -> str:
+    return (
+        "SELECT DISTINCT pl.pr_url "
+        "FROM pr_links pl "
+        "JOIN sessions s ON s.session_id = pl.session_id "
+        "WHERE pl.pr_url IS NOT NULL AND pl.pr_url != '' "
+        f"AND {_scope_clause(scope, 's')}"
+    )
+
+
+def _pr_commit_rollup_sql(scope: Scope) -> str:
+    scoped = _scoped_pr_urls(scope)
+    return f"""
+        WITH scoped_pr_urls AS (
+            {scoped}
+        ),
+        pr_base AS (
+            SELECT
+                spu.pr_url,
+                pf.repo_full_name,
+                pf.pr_number,
+                pf.opened_at,
+                pf.merged_at
+            FROM scoped_pr_urls spu
+            LEFT JOIN pr_facts pf ON pf.pr_url = spu.pr_url
+        ),
+        timeline_first AS (
+            SELECT
+                pr_url,
+                commit_sha,
+                MIN(event_at) AS first_event_at
+            FROM pr_commit_events
+            WHERE event_type = 'committed' AND commit_sha IS NOT NULL
+            GROUP BY pr_url, commit_sha
+        ),
+        timeline_counts AS (
+            SELECT
+                pb.pr_url,
+                COUNT(DISTINCT CASE WHEN tf.first_event_at < pb.opened_at THEN tf.commit_sha END) AS pre_count,
+                COUNT(DISTINCT CASE WHEN tf.first_event_at >= pb.opened_at THEN tf.commit_sha END) AS post_count,
+                COUNT(DISTINCT tf.commit_sha) AS total_count
+            FROM pr_base pb
+            LEFT JOIN timeline_first tf ON tf.pr_url = pb.pr_url
+            WHERE pb.opened_at IS NOT NULL
+            GROUP BY pb.pr_url
+        ),
+        final_counts AS (
+            SELECT
+                pb.pr_url,
+                COUNT(DISTINCT CASE WHEN COALESCE(pcf.authored_at, pcf.committed_at) < pb.opened_at THEN pcf.commit_sha END) AS pre_count,
+                COUNT(DISTINCT CASE WHEN COALESCE(pcf.authored_at, pcf.committed_at) >= pb.opened_at THEN pcf.commit_sha END) AS post_count,
+                COUNT(DISTINCT pcf.commit_sha) AS total_count
+            FROM pr_base pb
+            LEFT JOIN pr_commits_final pcf ON pcf.pr_url = pb.pr_url
+            WHERE pb.opened_at IS NOT NULL
+            GROUP BY pb.pr_url
+        ),
+        rollup AS (
+            SELECT
+                pb.pr_url,
+                COALESCE(pb.repo_full_name, '') AS repo_full_name,
+                pb.pr_number,
+                pb.opened_at,
+                pb.merged_at,
+                CASE
+                    WHEN pb.opened_at IS NULL THEN 0
+                    WHEN COALESCE(tc.total_count, 0) > 0 THEN COALESCE(tc.pre_count, 0)
+                    WHEN COALESCE(fc.total_count, 0) > 0 THEN COALESCE(fc.pre_count, 0)
+                    ELSE 0
+                END AS pre_commits,
+                CASE
+                    WHEN pb.opened_at IS NULL THEN 0
+                    WHEN COALESCE(tc.total_count, 0) > 0 THEN COALESCE(tc.post_count, 0)
+                    WHEN COALESCE(fc.total_count, 0) > 0 THEN COALESCE(fc.post_count, 0)
+                    ELSE 0
+                END AS post_commits,
+                CASE
+                    WHEN pb.opened_at IS NULL THEN 'LOW'
+                    WHEN COALESCE(tc.total_count, 0) > 0 THEN 'HIGH'
+                    WHEN COALESCE(fc.total_count, 0) > 0 THEN 'MED'
+                    ELSE 'LOW'
+                END AS confidence
+            FROM pr_base pb
+            LEFT JOIN timeline_counts tc ON tc.pr_url = pb.pr_url
+            LEFT JOIN final_counts fc ON fc.pr_url = pb.pr_url
+        )
+    """
+
+
+def _get_meta(key: str) -> str | None:
+    if not DB_FILE.exists():
+        return None
+    try:
+        with sqlite3.connect(DB_FILE) as conn:
+            row = conn.execute("SELECT value FROM extraction_meta WHERE key = ?", (key,)).fetchone()
+            return row[0] if row else None
+    except sqlite3.Error:
+        return None
+
+
+def _pr_coverage(conn: sqlite3.Connection, scope: Scope) -> tuple[int, int]:
+    row = conn.execute(
+        f"""
+        SELECT
+            COUNT(DISTINCT pl.pr_url) AS total_links,
+            COUNT(DISTINCT pf.pr_url) AS matched
+        FROM pr_links pl
+        JOIN sessions s ON s.session_id = pl.session_id
+        LEFT JOIN pr_facts pf ON pf.pr_url = pl.pr_url
+        WHERE pl.pr_url IS NOT NULL
+          AND pl.pr_url != ''
+          AND {_scope_clause(scope, 's')}
+        """
+    ).fetchone()
+    total = int((row[0] if row else 0) or 0)
+    matched = int((row[1] if row else 0) or 0)
+    return matched, total
+
+
+def _schema_outdated() -> bool:
+    v = _get_meta("schema_version")
+    return bool(DB_FILE.exists() and v != SCHEMA_VERSION)
+
+def get_velocity_banner(scope: Scope = "all_activity") -> dict:
     if not DB_FILE.exists():
         return {}
     try:
         with sqlite3.connect(DB_FILE) as conn:
-            prs_week = conn.execute("""
-                SELECT COUNT(*) FROM git_operations
-                WHERE git_op_type = 'pr_create'
-                AND datetime(timestamp) >= datetime('now', '-7 days')
-            """).fetchone()[0]
-            commits_7d = conn.execute("""
-                SELECT COUNT(*) FROM git_operations
-                WHERE git_op_type = 'commit'
-                AND datetime(timestamp) >= datetime('now', '-7 days')
-            """).fetchone()[0]
-            avg_lead = conn.execute("""
-                WITH branch_first AS (
-                    SELECT git_branch, MIN(first_timestamp) as first_session
-                    FROM sessions
-                    WHERE is_subagent = 0 AND git_branch IS NOT NULL
+            prs_week = conn.execute(
+                f"""
+                SELECT COUNT(DISTINCT pf.pr_url)
+                FROM pr_facts pf
+                JOIN pr_links pl ON pl.pr_url = pf.pr_url
+                JOIN sessions s ON s.session_id = pl.session_id
+                WHERE datetime(pf.merged_at) >= datetime('now', '-7 days')
+                  AND {_scope_clause(scope, 's')}
+                """
+            ).fetchone()[0]
+            commits_7d = conn.execute(
+                f"""
+                SELECT COUNT(*)
+                FROM git_operations g
+                JOIN sessions s ON s.session_id = g.session_id
+                WHERE g.git_op_type = 'commit'
+                  AND datetime(g.timestamp) >= datetime('now', '-7 days')
+                  AND {_scope_clause(scope, 's')}
+                """
+            ).fetchone()[0]
+            avg_lead = conn.execute(
+                f"""
+                WITH scoped_sessions AS (
+                    SELECT * FROM sessions s WHERE {_scope_clause(scope, 's')}
+                ),
+                branch_first AS (
+                    SELECT git_branch, MIN(first_timestamp) AS first_session
+                    FROM scoped_sessions
+                    WHERE git_branch IS NOT NULL
                     GROUP BY git_branch
                 ),
-                pr_times AS (
-                    SELECT s.git_branch, MIN(g.timestamp) as pr_created
-                    FROM git_operations g
-                    JOIN sessions s ON g.session_id = s.session_id
-                    WHERE g.git_op_type = 'pr_create'
-                    GROUP BY s.git_branch
+                pr_primary AS (
+                    SELECT DISTINCT pf.pr_url,
+                           COALESCE(pf.head_branch, ss.git_branch) AS branch_name,
+                           pf.opened_at
+                    FROM pr_facts pf
+                    JOIN pr_links pl ON pl.pr_url = pf.pr_url
+                    JOIN scoped_sessions ss ON ss.session_id = pl.session_id
+                    WHERE pf.opened_at IS NOT NULL
                 )
-                SELECT AVG((julianday(pt.pr_created) - julianday(bf.first_session)) * 24)
-                FROM pr_times pt
-                JOIN branch_first bf ON pt.git_branch = bf.git_branch
-            """).fetchone()[0]
-            push_row = conn.execute("""
+                SELECT AVG((julianday(pp.opened_at) - julianday(bf.first_session)) * 24.0)
+                FROM pr_primary pp
+                JOIN branch_first bf ON bf.git_branch = pp.branch_name
+                """
+            ).fetchone()[0]
+            push_row = conn.execute(
+                f"""
                 SELECT
-                    SUM(CASE WHEN git_op_type = 'push'   THEN 1 ELSE 0 END) * 1.0,
-                    SUM(CASE WHEN git_op_type = 'commit' THEN 1 ELSE 0 END)
-                FROM git_operations
-            """).fetchone()
+                    SUM(CASE WHEN g.git_op_type = 'push' THEN 1 ELSE 0 END) * 1.0,
+                    SUM(CASE WHEN g.git_op_type = 'commit' THEN 1 ELSE 0 END)
+                FROM git_operations g
+                JOIN sessions s ON s.session_id = g.session_id
+                WHERE {_scope_clause(scope, 's')}
+                """
+            ).fetchone()
+            matched, total = _pr_coverage(conn, scope)
             push_rate = (push_row[0] or 0) / max(push_row[1] or 0, 1)
             return {
-                "prs_week": prs_week,
-                "commits_day": commits_7d / 7.0,
+                "prs_week": prs_week or 0,
+                "commits_day": (commits_7d or 0) / 7.0,
                 "avg_lead_time_h": avg_lead or 0,
                 "push_rate": push_rate,
+                "coverage_num": matched,
+                "coverage_den": total,
+                "confidence": _confidence_label(matched, total),
             }
     except sqlite3.Error:
         return {}
 
-def get_weekly_throughput(weeks: int = 8) -> list[tuple]:
+
+def get_weekly_throughput(weeks: int = 8, scope: Scope = "all_activity") -> list[tuple]:
     if not DB_FILE.exists():
         return []
     try:
         with sqlite3.connect(DB_FILE) as conn:
-            return conn.execute("""
-                WITH weekly_ops AS (
-                    SELECT
-                        strftime('%Y-W%W', timestamp) as week,
-                        SUM(CASE WHEN git_op_type = 'pr_create' THEN 1 ELSE 0 END) as prs_created,
-                        SUM(CASE WHEN git_op_type = 'pr_merge'  THEN 1 ELSE 0 END) as prs_merged,
-                        SUM(CASE WHEN git_op_type = 'commit'    THEN 1 ELSE 0 END) as commits
-                    FROM git_operations
-                    WHERE timestamp IS NOT NULL
-                    GROUP BY week
-                    ORDER BY week DESC
-                    LIMIT ?
+            return conn.execute(
+                f"""
+                WITH scoped_sessions AS (
+                    SELECT * FROM sessions s WHERE {_scope_clause(scope, 's')}
                 ),
                 branch_first AS (
-                    SELECT git_branch, MIN(first_timestamp) as first_session
-                    FROM sessions
-                    WHERE is_subagent = 0 AND git_branch IS NOT NULL
+                    SELECT git_branch, MIN(first_timestamp) AS first_session
+                    FROM scoped_sessions
+                    WHERE git_branch IS NOT NULL
                     GROUP BY git_branch
                 ),
-                pr_times AS (
-                    SELECT
-                        s.git_branch,
-                        strftime('%Y-W%W', g.timestamp) as pr_week,
-                        MIN(g.timestamp) as pr_created
+                pr_primary AS (
+                    SELECT DISTINCT
+                        pf.pr_url,
+                        COALESCE(pf.head_branch, ss.git_branch) AS branch_name,
+                        pf.opened_at,
+                        pf.merged_at
+                    FROM pr_facts pf
+                    JOIN pr_links pl ON pl.pr_url = pf.pr_url
+                    JOIN scoped_sessions ss ON ss.session_id = pl.session_id
+                ),
+                created_by_week AS (
+                    SELECT strftime('%Y-W%W', opened_at) AS week, COUNT(*) AS prs_created
+                    FROM pr_primary
+                    WHERE opened_at IS NOT NULL
+                    GROUP BY week
+                ),
+                merged_by_week AS (
+                    SELECT strftime('%Y-W%W', merged_at) AS week, COUNT(*) AS prs_merged
+                    FROM pr_primary
+                    WHERE merged_at IS NOT NULL
+                    GROUP BY week
+                ),
+                commits_by_week AS (
+                    SELECT strftime('%Y-W%W', g.timestamp) AS week, COUNT(*) AS commits
                     FROM git_operations g
-                    JOIN sessions s ON g.session_id = s.session_id
-                    WHERE g.git_op_type = 'pr_create'
-                    GROUP BY s.git_branch
+                    JOIN scoped_sessions ss ON ss.session_id = g.session_id
+                    WHERE g.git_op_type = 'commit' AND g.timestamp IS NOT NULL
+                    GROUP BY week
                 ),
                 lead_by_week AS (
                     SELECT
-                        pt.pr_week as week,
-                        AVG((julianday(pt.pr_created) - julianday(bf.first_session)) * 24) as avg_lead_h
-                    FROM pr_times pt
-                    JOIN branch_first bf ON pt.git_branch = bf.git_branch
-                    GROUP BY pt.pr_week
+                        strftime('%Y-W%W', pp.opened_at) AS week,
+                        AVG((julianday(pp.opened_at) - julianday(bf.first_session)) * 24.0) AS avg_lead_h
+                    FROM pr_primary pp
+                    JOIN branch_first bf ON bf.git_branch = pp.branch_name
+                    WHERE pp.opened_at IS NOT NULL
+                    GROUP BY week
+                ),
+                weeks_to_show AS (
+                    SELECT week FROM created_by_week
+                    UNION
+                    SELECT week FROM merged_by_week
+                    UNION
+                    SELECT week FROM commits_by_week
+                    ORDER BY week DESC
+                    LIMIT ?
                 )
-                SELECT w.week, w.prs_created, w.prs_merged, w.commits, COALESCE(l.avg_lead_h, 0)
-                FROM weekly_ops w
-                LEFT JOIN lead_by_week l ON w.week = l.week
+                SELECT
+                    w.week,
+                    COALESCE(cbw.prs_created, 0),
+                    COALESCE(mbw.prs_merged, 0),
+                    COALESCE(cmw.commits, 0),
+                    COALESCE(lbw.avg_lead_h, 0)
+                FROM weeks_to_show w
+                LEFT JOIN created_by_week cbw ON cbw.week = w.week
+                LEFT JOIN merged_by_week mbw ON mbw.week = w.week
+                LEFT JOIN commits_by_week cmw ON cmw.week = w.week
+                LEFT JOIN lead_by_week lbw ON lbw.week = w.week
                 ORDER BY w.week DESC
-            """, (weeks,)).fetchall()
+                """,
+                (weeks,),
+            ).fetchall()
     except sqlite3.Error:
         return []
 
-def get_recent_prs(limit: int = 10) -> list[tuple]:
+
+def get_recent_prs(limit: int = 10, scope: Scope = "all_activity") -> list[tuple]:
     if not DB_FILE.exists():
         return []
     try:
         with sqlite3.connect(DB_FILE) as conn:
-            return conn.execute("""
+            return conn.execute(
+                f"""
                 SELECT
-                    substr(pl.timestamp, 1, 10) as date,
-                    pl.pr_number,
-                    pl.pr_repository,
+                    substr(COALESCE(pf.opened_at, pl.timestamp), 1, 10) AS date,
+                    COALESCE(pf.pr_number, pl.pr_number) AS pr_number,
+                    COALESCE(pf.repo_full_name, pl.pr_repository) AS repo_name,
                     s.git_branch
                 FROM pr_links pl
-                LEFT JOIN sessions s ON pl.session_id = s.session_id
-                ORDER BY pl.timestamp DESC
+                JOIN sessions s ON s.session_id = pl.session_id
+                LEFT JOIN pr_facts pf ON pf.pr_url = pl.pr_url
+                WHERE {_scope_clause(scope, 's')}
+                ORDER BY COALESCE(pf.opened_at, pl.timestamp) DESC
                 LIMIT ?
-            """, (limit,)).fetchall()
+                """,
+                (limit,),
+            ).fetchall()
     except sqlite3.Error:
         return []
 
-def get_pr_lifecycle(limit: int = 15) -> list[tuple]:
+
+def get_pr_lifecycle(limit: int = 15, scope: Scope = "all_activity") -> list[tuple]:
     if not DB_FILE.exists():
         return []
     try:
         with sqlite3.connect(DB_FILE) as conn:
-            return conn.execute("""
-                WITH branch_sessions AS (
+            matched, total = _pr_coverage(conn, scope)
+            confidence = _confidence_label(matched, total)
+            primary = conn.execute(
+                f"""
+                WITH scoped_sessions AS (
+                    SELECT * FROM sessions s WHERE {_scope_clause(scope, 's')}
+                ),
+                branch_first AS (
+                    SELECT git_branch, MIN(first_timestamp) AS first_session
+                    FROM scoped_sessions
+                    WHERE git_branch IS NOT NULL
+                    GROUP BY git_branch
+                ),
+                branch_sessions AS (
+                    SELECT git_branch, COUNT(DISTINCT session_id) AS sessions
+                    FROM scoped_sessions
+                    WHERE git_branch IS NOT NULL
+                    GROUP BY git_branch
+                ),
+                branch_commits AS (
+                    SELECT ss.git_branch, COUNT(*) AS commits
+                    FROM git_operations g
+                    JOIN scoped_sessions ss ON ss.session_id = g.session_id
+                    WHERE g.git_op_type = 'commit'
+                    GROUP BY ss.git_branch
+                ),
+                pr_primary AS (
+                    SELECT DISTINCT
+                        pf.pr_url,
+                        COALESCE(pf.head_branch, ss.git_branch) AS branch_name,
+                        pf.opened_at
+                    FROM pr_facts pf
+                    JOIN pr_links pl ON pl.pr_url = pf.pr_url
+                    JOIN scoped_sessions ss ON ss.session_id = pl.session_id
+                    WHERE pf.opened_at IS NOT NULL
+                )
+                SELECT
+                    pp.branch_name AS git_branch,
+                    (julianday(pp.opened_at) - julianday(bf.first_session)) * 24.0 AS lead_time_h,
+                    COALESCE(bs.sessions, 0) AS sessions,
+                    COALESCE(bc.commits, 0) AS commits,
+                    substr(bf.first_session, 1, 10) AS first_session_date,
+                    substr(pp.opened_at, 1, 10) AS pr_created_date
+                FROM pr_primary pp
+                JOIN branch_first bf ON bf.git_branch = pp.branch_name
+                LEFT JOIN branch_sessions bs ON bs.git_branch = pp.branch_name
+                LEFT JOIN branch_commits bc ON bc.git_branch = pp.branch_name
+                ORDER BY lead_time_h DESC
+                LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
+            if primary:
+                return [tuple(row) + (confidence,) for row in primary]
+
+            fallback = conn.execute(
+                f"""
+                WITH scoped_sessions AS (
+                    SELECT * FROM sessions s WHERE {_scope_clause(scope, 's')}
+                ),
+                branch_sessions AS (
                     SELECT
                         git_branch,
-                        MIN(first_timestamp) as first_session,
-                        COUNT(DISTINCT session_id) as sessions
-                    FROM sessions
-                    WHERE is_subagent = 0 AND git_branch IS NOT NULL
+                        MIN(first_timestamp) AS first_session,
+                        COUNT(DISTINCT session_id) AS sessions
+                    FROM scoped_sessions
+                    WHERE git_branch IS NOT NULL
                     GROUP BY git_branch
                 ),
                 pr_times AS (
-                    SELECT s.git_branch, MIN(g.timestamp) as pr_created
+                    SELECT ss.git_branch, MIN(g.timestamp) AS pr_created
                     FROM git_operations g
-                    JOIN sessions s ON g.session_id = s.session_id
+                    JOIN scoped_sessions ss ON ss.session_id = g.session_id
                     WHERE g.git_op_type = 'pr_create'
-                    GROUP BY s.git_branch
+                    GROUP BY ss.git_branch
                 ),
                 branch_commits AS (
-                    SELECT s.git_branch, COUNT(*) as commits
+                    SELECT ss.git_branch, COUNT(*) AS commits
                     FROM git_operations g
-                    JOIN sessions s ON g.session_id = s.session_id
+                    JOIN scoped_sessions ss ON ss.session_id = g.session_id
                     WHERE g.git_op_type = 'commit'
-                    GROUP BY s.git_branch
+                    GROUP BY ss.git_branch
                 )
                 SELECT
                     bs.git_branch,
-                    (julianday(pt.pr_created) - julianday(bs.first_session)) * 24 as lead_time_h,
+                    (julianday(pt.pr_created) - julianday(bs.first_session)) * 24.0 AS lead_time_h,
                     bs.sessions,
-                    COALESCE(bc.commits, 0) as commits,
-                    substr(bs.first_session, 1, 10) as first_session_date,
-                    substr(pt.pr_created, 1, 10) as pr_created_date
+                    COALESCE(bc.commits, 0) AS commits,
+                    substr(bs.first_session, 1, 10) AS first_session_date,
+                    substr(pt.pr_created, 1, 10) AS pr_created_date
                 FROM branch_sessions bs
                 JOIN pr_times pt ON bs.git_branch = pt.git_branch
                 LEFT JOIN branch_commits bc ON bs.git_branch = bc.git_branch
                 ORDER BY lead_time_h DESC
                 LIMIT ?
-            """, (limit,)).fetchall()
+                """,
+                (limit,),
+            ).fetchall()
+            return [tuple(row) + ("LOW",) for row in fallback]
     except sqlite3.Error:
         return []
 
-def get_rework_hotspots(limit: int = 10) -> list[tuple]:
-    if not DB_FILE.exists():
-        return []
-    try:
-        with sqlite3.connect(DB_FILE) as conn:
-            return conn.execute("""
-                WITH branch_sessions AS (
-                    SELECT
-                        git_branch,
-                        COUNT(DISTINCT session_id) as sessions,
-                        SUM(COALESCE(total_duration_ms, 0)) / 1000.0 as total_duration_s
-                    FROM sessions
-                    WHERE is_subagent = 0 AND git_branch IS NOT NULL
-                    GROUP BY git_branch
-                    HAVING sessions > 2
-                ),
-                branch_commits AS (
-                    SELECT s.git_branch, COUNT(*) as commits
-                    FROM git_operations g
-                    JOIN sessions s ON g.session_id = s.session_id
-                    WHERE g.git_op_type = 'commit' AND s.is_subagent = 0
-                    GROUP BY s.git_branch
-                )
-                SELECT
-                    bs.git_branch,
-                    bs.sessions,
-                    COALESCE(bc.commits, 0) as commits,
-                    bs.total_duration_s,
-                    CAST(COALESCE(bc.commits, 0) AS REAL) / bs.sessions as commits_per_session
-                FROM branch_sessions bs
-                LEFT JOIN branch_commits bc ON bs.git_branch = bc.git_branch
-                ORDER BY bs.sessions DESC
-                LIMIT ?
-            """, (limit,)).fetchall()
-    except sqlite3.Error:
-        return []
 
-def get_efficiency_metrics() -> dict:
+def get_pr_commit_timing_summary(scope: Scope = "all_activity") -> dict:
     if not DB_FILE.exists():
         return {}
     try:
         with sqlite3.connect(DB_FILE) as conn:
-            total_main = conn.execute(
-                "SELECT COUNT(*) FROM sessions WHERE is_subagent=0"
+            row = conn.execute(
+                _pr_commit_rollup_sql(scope)
+                + """
+                SELECT
+                    COALESCE(AVG(CASE WHEN confidence != 'LOW' THEN pre_commits END), 0),
+                    COALESCE(AVG(CASE WHEN confidence != 'LOW' THEN post_commits END), 0),
+                    COALESCE(
+                        SUM(CASE WHEN confidence != 'LOW' THEN post_commits ELSE 0 END) * 1.0
+                        / NULLIF(
+                            SUM(CASE WHEN confidence != 'LOW' THEN (pre_commits + post_commits) ELSE 0 END),
+                            0
+                        ),
+                        0.0
+                    ),
+                    SUM(CASE WHEN confidence != 'LOW' THEN 1 ELSE 0 END) AS covered,
+                    COUNT(*) AS total,
+                    SUM(CASE WHEN confidence = 'HIGH' THEN 1 ELSE 0 END) AS high_count,
+                    SUM(CASE WHEN confidence = 'MED' THEN 1 ELSE 0 END) AS med_count,
+                    SUM(CASE WHEN confidence = 'LOW' THEN 1 ELSE 0 END) AS low_count
+                FROM rollup
+                """
+            ).fetchone()
+            covered = int((row[3] if row else 0) or 0)
+            total = int((row[4] if row else 0) or 0)
+            return {
+                "avg_pre": float((row[0] if row else 0) or 0),
+                "avg_post": float((row[1] if row else 0) or 0),
+                "post_ratio": float((row[2] if row else 0) or 0),
+                "coverage_num": covered,
+                "coverage_den": total,
+                "high_count": int((row[5] if row else 0) or 0),
+                "med_count": int((row[6] if row else 0) or 0),
+                "low_count": int((row[7] if row else 0) or 0),
+                "confidence": _confidence_label(covered, total),
+            }
+    except sqlite3.Error:
+        return {}
+
+
+def get_pr_post_open_commit_outliers(limit: int = 10, scope: Scope = "all_activity") -> list[tuple]:
+    if not DB_FILE.exists():
+        return []
+    try:
+        with sqlite3.connect(DB_FILE) as conn:
+            return conn.execute(
+                _pr_commit_rollup_sql(scope)
+                + """
+                SELECT
+                    pr_number,
+                    repo_full_name,
+                    opened_at,
+                    merged_at,
+                    pre_commits,
+                    post_commits,
+                    CASE
+                        WHEN (pre_commits + post_commits) > 0
+                        THEN (post_commits * 100.0) / (pre_commits + post_commits)
+                        ELSE 0
+                    END AS post_pct,
+                    confidence
+                FROM rollup
+                WHERE confidence != 'LOW'
+                ORDER BY post_commits DESC, post_pct DESC, opened_at DESC
+                LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
+    except sqlite3.Error:
+        return []
+
+
+def get_pr_commit_timing_details(limit: int = 15, scope: Scope = "all_activity") -> list[tuple]:
+    if not DB_FILE.exists():
+        return []
+    try:
+        with sqlite3.connect(DB_FILE) as conn:
+            return conn.execute(
+                _pr_commit_rollup_sql(scope)
+                + """
+                SELECT
+                    pr_number,
+                    repo_full_name,
+                    opened_at,
+                    merged_at,
+                    pre_commits,
+                    post_commits,
+                    CASE
+                        WHEN (pre_commits + post_commits) > 0
+                        THEN (post_commits * 100.0) / (pre_commits + post_commits)
+                        ELSE 0
+                    END AS post_pct,
+                    confidence
+                FROM rollup
+                ORDER BY opened_at DESC, post_commits DESC
+                LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
+    except sqlite3.Error:
+        return []
+
+
+def get_rework_hotspots(limit: int = 10, scope: Scope = "all_activity") -> list[tuple]:
+    if not DB_FILE.exists():
+        return []
+    try:
+        with sqlite3.connect(DB_FILE) as conn:
+            return conn.execute(
+                f"""
+                WITH scoped_sessions AS (
+                    SELECT * FROM sessions s WHERE {_scope_clause(scope, 's')}
+                ),
+                branch_sessions AS (
+                    SELECT
+                        git_branch,
+                        COUNT(DISTINCT session_id) AS sessions,
+                        SUM(COALESCE(total_duration_ms, 0)) / 1000.0 AS total_duration_s
+                    FROM scoped_sessions
+                    WHERE git_branch IS NOT NULL
+                    GROUP BY git_branch
+                    HAVING sessions > 2
+                ),
+                branch_commits AS (
+                    SELECT ss.git_branch, COUNT(*) AS commits
+                    FROM git_operations g
+                    JOIN scoped_sessions ss ON ss.session_id = g.session_id
+                    WHERE g.git_op_type = 'commit'
+                    GROUP BY ss.git_branch
+                )
+                SELECT
+                    bs.git_branch,
+                    bs.sessions,
+                    COALESCE(bc.commits, 0) AS commits,
+                    bs.total_duration_s,
+                    CAST(COALESCE(bc.commits, 0) AS REAL) / bs.sessions AS commits_per_session
+                FROM branch_sessions bs
+                LEFT JOIN branch_commits bc ON bs.git_branch = bc.git_branch
+                ORDER BY bs.sessions DESC
+                LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
+    except sqlite3.Error:
+        return []
+
+
+def get_efficiency_metrics(scope: Scope = "all_activity") -> dict:
+    if not DB_FILE.exists():
+        return {}
+    try:
+        with sqlite3.connect(DB_FILE) as conn:
+            total_sessions = conn.execute(
+                f"SELECT COUNT(*) FROM sessions s WHERE {_scope_clause(scope, 's')}"
             ).fetchone()[0] or 1
-            productive = conn.execute("""
+            productive = conn.execute(
+                f"""
                 SELECT COUNT(DISTINCT s.session_id)
                 FROM sessions s
                 JOIN git_operations g ON g.session_id = s.session_id
-                WHERE s.is_subagent = 0 AND g.git_op_type = 'commit'
-            """).fetchone()[0]
+                WHERE {_scope_clause(scope, 's')}
+                  AND g.git_op_type = 'commit'
+                """
+            ).fetchone()[0]
             avg_dur = conn.execute(
-                "SELECT AVG(total_duration_ms) FROM sessions WHERE is_subagent=0 AND total_duration_ms IS NOT NULL"
+                f"""
+                SELECT AVG(total_duration_ms)
+                FROM sessions s
+                WHERE {_scope_clause(scope, 's')} AND total_duration_ms IS NOT NULL
+                """
             ).fetchone()[0]
             sub_count = conn.execute("SELECT COUNT(*) FROM sessions WHERE is_subagent=1").fetchone()[0]
             main_count = conn.execute("SELECT COUNT(*) FROM sessions WHERE is_subagent=0").fetchone()[0]
-            total_commits = conn.execute("""
-                SELECT COUNT(*) FROM git_operations g
-                JOIN sessions s ON g.session_id = s.session_id
-                WHERE s.is_subagent = 0 AND g.git_op_type = 'commit'
-            """).fetchone()[0] or 1
+            total_commits = conn.execute(
+                f"""
+                SELECT COUNT(*)
+                FROM git_operations g
+                JOIN sessions s ON s.session_id = g.session_id
+                WHERE {_scope_clause(scope, 's')}
+                  AND g.git_op_type = 'commit'
+                """
+            ).fetchone()[0] or 1
             rows = conn.execute(
-                "SELECT usage_by_model FROM sessions WHERE is_subagent=0 AND usage_by_model IS NOT NULL"
+                f"""
+                SELECT usage_by_model
+                FROM sessions s
+                WHERE {_scope_clause(scope, 's')} AND usage_by_model IS NOT NULL
+                """
             ).fetchall()
             total_tokens = 0
             for (ubm,) in rows:
@@ -490,7 +901,7 @@ def get_efficiency_metrics() -> dict:
                 except (json.JSONDecodeError, AttributeError):
                     pass
             return {
-                "productivity_rate": productive / total_main * 100,
+                "productivity_rate": productive / total_sessions * 100,
                 "tokens_per_commit": total_tokens / total_commits,
                 "avg_duration_s": (avg_dur or 0) / 1000.0,
                 "subagent_ratio": sub_count / max(main_count, 1),
@@ -498,37 +909,47 @@ def get_efficiency_metrics() -> dict:
     except sqlite3.Error:
         return {}
 
-def get_model_efficiency() -> list[tuple]:
+
+def get_model_efficiency(scope: Scope = "all_activity") -> list[tuple]:
     if not DB_FILE.exists():
         return []
     try:
         with sqlite3.connect(DB_FILE) as conn:
             model_stats: dict[str, dict] = {}
-            for model, cnt, avg_dur in conn.execute("""
-                SELECT model, COUNT(*) as sessions, AVG(total_duration_ms)
-                FROM sessions
-                WHERE is_subagent = 0 AND model IS NOT NULL
+            for model, cnt, avg_dur in conn.execute(
+                f"""
+                SELECT model, COUNT(*) AS sessions, AVG(total_duration_ms)
+                FROM sessions s
+                WHERE {_scope_clause(scope, 's')} AND model IS NOT NULL
                 GROUP BY model ORDER BY sessions DESC
-            """).fetchall():
+                """
+            ).fetchall():
                 model_stats[model] = {
                     "sessions": cnt,
                     "avg_dur_s": (avg_dur or 0) / 1000.0,
                     "tokens": 0,
                     "commits": 0,
                 }
-            for model, commits in conn.execute("""
-                SELECT s.model, COUNT(*) as commits
+            for model, commits in conn.execute(
+                f"""
+                SELECT s.model, COUNT(*) AS commits
                 FROM sessions s
                 JOIN git_operations g ON g.session_id = s.session_id
-                WHERE s.is_subagent = 0 AND g.git_op_type = 'commit' AND s.model IS NOT NULL
+                WHERE {_scope_clause(scope, 's')}
+                  AND g.git_op_type = 'commit' AND s.model IS NOT NULL
                 GROUP BY s.model
-            """).fetchall():
+                """
+            ).fetchall():
                 if model in model_stats:
                     model_stats[model]["commits"] = commits
-            for model, ubm in conn.execute("""
-                SELECT model, usage_by_model FROM sessions
-                WHERE is_subagent = 0 AND model IS NOT NULL AND usage_by_model IS NOT NULL
-            """).fetchall():
+            for model, ubm in conn.execute(
+                f"""
+                SELECT model, usage_by_model
+                FROM sessions s
+                WHERE {_scope_clause(scope, 's')}
+                  AND model IS NOT NULL AND usage_by_model IS NOT NULL
+                """
+            ).fetchall():
                 if model not in model_stats:
                     continue
                 try:
@@ -544,12 +965,14 @@ def get_model_efficiency() -> list[tuple]:
     except sqlite3.Error:
         return []
 
-def get_unproductive_sessions(limit: int = 10) -> list[tuple]:
+
+def get_unproductive_sessions(limit: int = 10, scope: Scope = "all_activity") -> list[tuple]:
     if not DB_FILE.exists():
         return []
     try:
         with sqlite3.connect(DB_FILE) as conn:
-            return conn.execute("""
+            return conn.execute(
+                f"""
                 SELECT
                     substr(s.first_timestamp, 1, 10),
                     s.total_duration_ms / 1000.0,
@@ -557,59 +980,73 @@ def get_unproductive_sessions(limit: int = 10) -> list[tuple]:
                     s.first_user_message
                 FROM sessions s
                 LEFT JOIN (
-                    SELECT session_id FROM git_operations GROUP BY session_id
+                    SELECT g.session_id
+                    FROM git_operations g
+                    GROUP BY g.session_id
                 ) gop ON gop.session_id = s.session_id
-                WHERE s.is_subagent = 0
+                WHERE {_scope_clause(scope, 's')}
                     AND s.total_duration_ms > 60000
                     AND gop.session_id IS NULL
                 ORDER BY s.total_duration_ms DESC
                 LIMIT ?
-            """, (limit,)).fetchall()
+                """,
+                (limit,),
+            ).fetchall()
     except sqlite3.Error:
         return []
 
-def get_tool_usage_enhanced() -> list[tuple]:
+
+def get_tool_usage_enhanced(scope: Scope = "all_activity") -> list[tuple]:
     if not DB_FILE.exists():
         return []
     try:
         with sqlite3.connect(DB_FILE) as conn:
-            return conn.execute("""
+            return conn.execute(
+                f"""
                 SELECT
-                    tool_name,
-                    SUM(call_count) as total_calls,
-                    COUNT(DISTINCT session_id) as session_count,
-                    AVG(call_count) as avg_per_session
-                FROM session_tool_summary
-                GROUP BY tool_name
+                    st.tool_name,
+                    SUM(st.call_count) AS total_calls,
+                    COUNT(DISTINCT st.session_id) AS session_count,
+                    AVG(st.call_count) AS avg_per_session
+                FROM session_tool_summary st
+                JOIN sessions s ON s.session_id = st.session_id
+                WHERE {_scope_clause(scope, 's')}
+                GROUP BY st.tool_name
                 ORDER BY total_calls DESC
                 LIMIT 30
-            """).fetchall()
+                """
+            ).fetchall()
     except sqlite3.Error:
         return []
 
-def get_aggregate_pipeline() -> list[dict]:
+
+def get_aggregate_pipeline(scope: Scope = "all_activity") -> list[dict]:
     if not DB_FILE.exists():
         return []
     try:
         with sqlite3.connect(DB_FILE) as conn:
             conn.row_factory = sqlite3.Row
-            phase_rows = conn.execute("""
+            phase_rows = conn.execute(
+                f"""
                 SELECT e.phase, COUNT(*) AS total_calls,
                        COUNT(DISTINCT e.session_id) AS session_count,
                        SUM(e.duration_ms) AS total_ms
                 FROM session_events e
                 JOIN sessions s ON s.session_id = e.session_id
-                WHERE s.is_subagent = 0
+                WHERE {_scope_clause(scope, 's')}
                 GROUP BY e.phase
-            """).fetchall()
-            tool_rows = conn.execute("""
+                """
+            ).fetchall()
+            tool_rows = conn.execute(
+                f"""
                 SELECT e.phase, e.tool_name, COUNT(*) AS cnt
                 FROM session_events e
                 JOIN sessions s ON s.session_id = e.session_id
-                WHERE s.is_subagent = 0
+                WHERE {_scope_clause(scope, 's')}
                 GROUP BY e.phase, e.tool_name
                 ORDER BY e.phase, cnt DESC
-            """).fetchall()
+                """
+            ).fetchall()
     except sqlite3.OperationalError:
         return []
     top_tools: dict[str, list] = {}
@@ -667,17 +1104,17 @@ def get_session_pipeline(session_id: str) -> list[dict]:
     } for r in phase_rows]
 
 
-def get_recent_sessions_for_select(limit: int = 30) -> list[tuple[str, str]]:
+def get_recent_sessions_for_select(limit: int = 30, scope: Scope = "all_activity") -> list[tuple[str, str]]:
     if not DB_FILE.exists():
         return []
     try:
         with sqlite3.connect(DB_FILE) as conn:
             conn.row_factory = sqlite3.Row
-            rows = conn.execute("""
+            rows = conn.execute(f"""
                 SELECT DISTINCT e.session_id, s.slug, s.first_timestamp
                 FROM session_events e
                 JOIN sessions s ON s.session_id = e.session_id
-                WHERE s.is_subagent = 0
+                WHERE {_scope_clause(scope, 's')}
                 ORDER BY s.first_timestamp DESC
                 LIMIT ?
             """, (limit,)).fetchall()
@@ -689,6 +1126,36 @@ def get_recent_sessions_for_select(limit: int = 30) -> list[tuple[str, str]]:
         slug = r["slug"] or r["session_id"][:8]
         result.append((f"{date} — {slug}", r["session_id"]))
     return result
+
+
+def get_default_code_rate(scope: Scope = "all_activity") -> float:
+    meta = _get_meta("default_code_rate")
+    if meta:
+        try:
+            val = float(meta)
+            if scope == "all_activity":
+                return val
+        except (TypeError, ValueError):
+            pass
+    if not DB_FILE.exists():
+        return 0.0
+    try:
+        with sqlite3.connect(DB_FILE) as conn:
+            row = conn.execute(
+                f"""
+                SELECT
+                    SUM(CASE WHEN e.phase = 'Code' THEN 1 ELSE 0 END),
+                    COUNT(*)
+                FROM session_events e
+                JOIN sessions s ON s.session_id = e.session_id
+                WHERE {_scope_clause(scope, 's')}
+                """
+            ).fetchone()
+            code_events = int((row[0] if row else 0) or 0)
+            all_events = int((row[1] if row else 0) or 0)
+            return (code_events / all_events) if all_events else 0.0
+    except sqlite3.Error:
+        return 0.0
 
 
 _PHASE_COLORS = {
@@ -911,9 +1378,16 @@ class SubprocessScreen(Screen):
 
 class StatsScreen(Screen):
     BINDINGS = [("escape", "app.pop_screen", "Back")]
+    _scope: Scope = "all_activity"
 
     def compose(self) -> ComposeResult:
         yield AnimatedBanner()
+        with Horizontal(id="scope-row"):
+            yield Label("Scope")
+            yield Select(
+                [("All Activity", "all_activity"), ("Delivery Only", "delivery_only")],
+                id="scope-select",
+            )
         with TabbedContent(initial="throughput"):
             with TabPane("Throughput", id="throughput"):
                 with Vertical():
@@ -928,6 +1402,13 @@ class StatsScreen(Screen):
                     yield DataTable(id="pr-lifecycle-table", cursor_type="row", zebra_stripes=True)
                     yield Label("[bold] Rework Hotspots[/bold]")
                     yield DataTable(id="rework-table", cursor_type="row", zebra_stripes=True)
+            with TabPane("PR Commit Timing", id="pr-commit-timing"):
+                with Vertical():
+                    yield Static(id="pr-commit-banner")
+                    yield Label("[bold] Post-Open Commit Outliers[/bold]")
+                    yield DataTable(id="pr-commit-outliers-table", cursor_type="row", zebra_stripes=True)
+                    yield Label("[bold] PR Commit Timing Details[/bold]")
+                    yield DataTable(id="pr-commit-details-table", cursor_type="row", zebra_stripes=True)
             with TabPane("Efficiency", id="efficiency"):
                 with Vertical():
                     yield Static(id="efficiency-banner")
@@ -950,81 +1431,162 @@ class StatsScreen(Screen):
         yield Footer()
 
     def on_mount(self) -> None:
+        scope_select = self.query_one("#scope-select", Select)
+        scope_select.value = "all_activity"
+        self._scope = "all_activity"
+        self._populate_all()
+
+    @staticmethod
+    def _prepare_table(table: DataTable, columns: tuple[str, ...]) -> None:
+        if len(table.columns) == 0:
+            table.add_columns(*columns)
+        else:
+            table.clear()
+
+    def _populate_all(self) -> None:
         self._populate_throughput()
         self._populate_lead_time()
+        self._populate_pr_commit_timing()
         self._populate_efficiency()
         self._populate_value_stream()
 
     def _populate_throughput(self) -> None:
-        v = get_velocity_banner()
+        v = get_velocity_banner(self._scope)
         prs = v.get("prs_week", 0)
         cpd = v.get("commits_day", 0)
         lt = v.get("avg_lead_time_h")
         pr_pct = v.get("push_rate", 0) * 100
+        conf = str(v.get("confidence", "LOW"))
+        cov_num = int(v.get("coverage_num", 0) or 0)
+        cov_den = int(v.get("coverage_den", 0) or 0)
 
         c_prs = _threshold_color(prs, *_THRESH["prs_week"])
         c_cpd = _threshold_color(cpd, *_THRESH["commits_day"])
         c_lt  = _threshold_color(lt, *_THRESH["lead_time_h"], lower_is_better=True)
         c_pr  = _threshold_color(pr_pct, *_THRESH["push_rate_pct"])
+        c_conf = _confidence_style(conf)
 
         self.query_one("#velocity-banner", Static).update(
+            f" Scope [bold]{_scope_label(self._scope)}[/bold]"
+            f"  ·  Confidence [{c_conf}]{conf}[/]"
+            f" ({cov_num}/{cov_den})"
+            f"  ·"
             f" PRs/week {_colored(str(prs), c_prs)}"
             f"  ·  Commits/day {_colored(f'{cpd:.1f}', c_cpd)}"
             f"  ·  Avg lead time {_colored(f'{lt or 0:.1f}h', c_lt)}"
             f"  ·  Push rate {_colored(f'{pr_pct:.1f}%', c_pr)}"
         )
         wt = self.query_one("#weekly-throughput-table", DataTable)
-        wt.add_columns("Week", "PRs Created", "PRs Merged", "Commits", "Lead Time (avg)")
-        for week, prs_c, prs_m, commits, lead_h in get_weekly_throughput():
+        self._prepare_table(wt, ("Week", "PRs Created", "PRs Merged", "Commits", "Lead Time (avg)"))
+        for week, prs_c, prs_m, commits, lead_h in get_weekly_throughput(scope=self._scope):
             lead_h_clamped, c = _lead_time_clamp_color(lead_h)
             lead_cell = Text(f"{lead_h_clamped:.1f}h" if lead_h_clamped is not None else "—", style=f"bold {c}" if c else "")
             wt.add_row(week, str(prs_c), str(prs_m), str(commits), lead_cell)
         rt = self.query_one("#recent-prs-table", DataTable)
-        rt.add_columns("Date", "PR#", "Repository", "Branch")
-        for date, pr_num, repo, branch in get_recent_prs():
+        self._prepare_table(rt, ("Date", "PR#", "Repository", "Branch"))
+        for date, pr_num, repo, branch in get_recent_prs(scope=self._scope):
             rt.add_row(date or "", f"#{pr_num}" if pr_num else "—",
                        (repo or "")[:30], (branch or "")[:40])
 
     def _populate_lead_time(self) -> None:
         lc = self.query_one("#pr-lifecycle-table", DataTable)
-        lc.add_columns("Branch", "Lead Time", "Sessions", "Commits", "First Session", "PR Created")
-        for branch, lead_h, sessions, commits, first_s, pr_c in get_pr_lifecycle():
+        self._prepare_table(lc, ("Branch", "Lead Time", "Sessions", "Commits", "First Session", "PR Created", "Conf"))
+        for branch, lead_h, sessions, commits, first_s, pr_c, conf in get_pr_lifecycle(scope=self._scope):
             lead_h_clamped, c = _lead_time_clamp_color(lead_h)
             lead_cell = Text(_fmt_duration(lead_h_clamped * 3600) if lead_h_clamped is not None else "—", style=f"bold {c}" if c else "")
+            conf_cell = Text(conf, style=_confidence_style(conf))
             lc.add_row((branch or "")[:40], lead_cell,
-                       str(sessions), str(commits), first_s or "", pr_c or "")
+                       str(sessions), str(commits), first_s or "", pr_c or "", conf_cell)
         rw = self.query_one("#rework-table", DataTable)
-        rw.add_columns("Branch", "Sessions", "Commits", "Total Duration", "Commits/Session")
-        for branch, sessions, commits, dur_s, cps in get_rework_hotspots():
+        self._prepare_table(rw, ("Branch", "Sessions", "Commits", "Total Duration", "Commits/Session"))
+        for branch, sessions, commits, dur_s, cps in get_rework_hotspots(scope=self._scope):
             rw.add_row((branch or "")[:40], str(sessions), str(commits),
                        _fmt_duration(dur_s), f"{cps:.1f}")
 
+    def _populate_pr_commit_timing(self) -> None:
+        summary = get_pr_commit_timing_summary(self._scope)
+        avg_pre = float(summary.get("avg_pre", 0) or 0)
+        avg_post = float(summary.get("avg_post", 0) or 0)
+        post_ratio = float(summary.get("post_ratio", 0) or 0) * 100.0
+        cov_num = int(summary.get("coverage_num", 0) or 0)
+        cov_den = int(summary.get("coverage_den", 0) or 0)
+        conf = str(summary.get("confidence", "LOW"))
+        high_cnt = int(summary.get("high_count", 0) or 0)
+        med_cnt = int(summary.get("med_count", 0) or 0)
+        low_cnt = int(summary.get("low_count", 0) or 0)
+
+        c_conf = _confidence_style(conf)
+        self.query_one("#pr-commit-banner", Static).update(
+            f" Scope [bold]{_scope_label(self._scope)}[/bold]"
+            f"  ·  Confidence [{c_conf}]{conf}[/] ({cov_num}/{cov_den})"
+            f"  ·  Avg pre-PR commits [bold]{avg_pre:.1f}[/bold]"
+            f"  ·  Avg post-PR commits [bold]{avg_post:.1f}[/bold]"
+            f"  ·  Post-open ratio [bold]{post_ratio:.1f}%[/bold]"
+            f"  ·  Bands [bold]H:{high_cnt} M:{med_cnt} L:{low_cnt}[/bold]"
+        )
+
+        outliers = self.query_one("#pr-commit-outliers-table", DataTable)
+        self._prepare_table(outliers, ("PR", "Repo", "Opened", "Merged", "Pre", "Post", "Post %", "Confidence"))
+        for pr_num, repo, opened, merged, pre_c, post_c, post_pct, confidence in get_pr_post_open_commit_outliers(
+            scope=self._scope
+        ):
+            conf_cell = Text(str(confidence), style=_confidence_style(str(confidence)))
+            outliers.add_row(
+                f"#{pr_num}" if pr_num else "—",
+                (repo or "")[:36],
+                str(opened or "")[:10],
+                str(merged or "")[:10],
+                str(pre_c or 0),
+                str(post_c or 0),
+                f"{float(post_pct or 0):.1f}%",
+                conf_cell,
+            )
+
+        details = self.query_one("#pr-commit-details-table", DataTable)
+        self._prepare_table(details, ("PR", "Repo", "Opened", "Merged", "Pre", "Post", "Post %", "Confidence"))
+        for pr_num, repo, opened, merged, pre_c, post_c, post_pct, confidence in get_pr_commit_timing_details(
+            scope=self._scope
+        ):
+            conf_cell = Text(str(confidence), style=_confidence_style(str(confidence)))
+            details.add_row(
+                f"#{pr_num}" if pr_num else "—",
+                (repo or "")[:36],
+                str(opened or "")[:10],
+                str(merged or "")[:10],
+                str(pre_c or 0),
+                str(post_c or 0),
+                f"{float(post_pct or 0):.1f}%",
+                conf_cell,
+            )
+
     def _populate_efficiency(self) -> None:
-        e = get_efficiency_metrics()
+        e = get_efficiency_metrics(self._scope)
         prod = e.get('productivity_rate', 0)
         c_prod = _threshold_color(prod, *_THRESH["productivity"])
         self.query_one("#efficiency-banner", Static).update(
+            f" Scope [bold]{_scope_label(self._scope)}[/bold]"
+            f"  ·"
             f" Productivity {_colored(f'{prod:.0f}%', c_prod)}"
             f"  ·  Tokens/commit [bold]{_fmt_tokens(int(e.get('tokens_per_commit', 0)))}[/bold]"
             f"  ·  Avg session [bold]{_fmt_duration(e.get('avg_duration_s', 0))}[/bold]"
             f"  ·  Subagent ratio [bold]{e.get('subagent_ratio', 0):.1f}x[/bold]"
         )
         me = self.query_one("#model-efficiency-table", DataTable)
-        me.add_columns("Model", "Sessions", "Avg Duration", "Commits", "Tokens/Commit")
-        for model, sessions, avg_dur_s, commits, tpc in get_model_efficiency():
+        self._prepare_table(me, ("Model", "Sessions", "Avg Duration", "Commits", "Tokens/Commit"))
+        for model, sessions, avg_dur_s, commits, tpc in get_model_efficiency(self._scope):
             me.add_row(model or "unknown", f"{sessions:,}", _fmt_duration(avg_dur_s),
                        f"{commits:,}", _fmt_tokens(int(tpc)) if tpc else "—")
         ut = self.query_one("#unproductive-table", DataTable)
-        ut.add_columns("Date", "Duration", "Model", "First Prompt")
-        for date, dur_s, model, prompt in get_unproductive_sessions():
+        self._prepare_table(ut, ("Date", "Duration", "Model", "First Prompt"))
+        for date, dur_s, model, prompt in get_unproductive_sessions(scope=self._scope):
             dur_h = (dur_s / 3600) if dur_s is not None else None
             c = _threshold_color(dur_h, *_THRESH["unproductive_h"], lower_is_better=True)
             dur_cell = Text(_fmt_duration(dur_s), style=f"bold {c}" if c else "")
             ut.add_row(date or "", dur_cell, model or "unknown",
                        (prompt or "")[:80])
         tt = self.query_one("#tool-usage-table", DataTable)
-        tt.add_columns("Tool", "Total Calls", "Sessions", "Avg/Session")
-        for i, (tool, total, session_cnt, avg) in enumerate(get_tool_usage_enhanced()):
+        self._prepare_table(tt, ("Tool", "Total Calls", "Sessions", "Avg/Session"))
+        for i, (tool, total, session_cnt, avg) in enumerate(get_tool_usage_enhanced(self._scope)):
             if i < 3:
                 style = "bold"
             elif i < 10:
@@ -1036,16 +1598,22 @@ class StatsScreen(Screen):
 
     def _populate_value_stream(self) -> None:
         pt = self.query_one("#phase-table", DataTable)
-        pt.add_columns("Phase", "Calls", "Time %", "Sessions", "Top Tools")
+        self._prepare_table(pt, ("Phase", "Calls", "Time %", "Sessions", "Top Tools"))
         spt = self.query_one("#session-phase-table", DataTable)
-        spt.add_columns("Phase", "Calls", "Time %", "Top Tools")
+        self._prepare_table(spt, ("Phase", "Calls", "Time %", "Top Tools"))
 
-        phases = get_aggregate_pipeline()
+        phases = get_aggregate_pipeline(self._scope)
         banner = self.query_one("#vs-info-banner", Static)
+        code_rate = get_default_code_rate(self._scope) * 100
         if not phases:
-            banner.update("[yellow]No event data — run extraction to populate value stream.[/yellow]")
+            banner.update(
+                f"[yellow]No event data — run extraction to populate value stream.[/yellow] "
+                f"[dim](Scope: {_scope_label(self._scope)} · default-to-Code {code_rate:.1f}%)[/dim]"
+            )
             return
-        banner.update("")
+        banner.update(
+            f"[dim]Scope: {_scope_label(self._scope)} · default-to-Code rate: {code_rate:.1f}%[/dim]"
+        )
         self.query_one("#phase-bar", Static).update(render_phase_bar(phases))
 
         for p in sorted(phases, key=lambda x: _PHASE_ORDER.index(x["phase"]) if x["phase"] in _PHASE_ORDER else 99):
@@ -1053,15 +1621,30 @@ class StatsScreen(Screen):
             pt.add_row(_phase_cell(p["phase"]), f"{p['total_calls']:,}", f"{p['time_pct']}%",
                        f"{p['session_count']:,}", tools_str)
 
-        sessions = get_recent_sessions_for_select()
+        sessions = get_recent_sessions_for_select(scope=self._scope)
+        sel = self.query_one("#session-select", Select)
         if sessions:
-            sel = self.query_one("#session-select", Select)
             sel.set_options((label, sid) for label, sid in sessions)
+            sel.value = sessions[0][1]
+            self._populate_session_breakdown(sessions[0][1])
+        else:
+            sel.set_options([])
+            self.query_one("#session-phase-bar", Static).update("[dim]No sessions for this scope.[/dim]")
 
     def on_select_changed(self, event: Select.Changed) -> None:
-        if event.value is Select.BLANK:
+        if event.select.id == "scope-select":
+            if event.value is Select.BLANK:
+                return
+            self._scope = str(event.value)  # type: ignore[assignment]
+            self._populate_all()
             return
-        phases = get_session_pipeline(str(event.value))
+
+        if event.select.id != "session-select" or event.value is Select.BLANK:
+            return
+        self._populate_session_breakdown(str(event.value))
+
+    def _populate_session_breakdown(self, session_id: str) -> None:
+        phases = get_session_pipeline(session_id)
         bar = self.query_one("#session-phase-bar", Static)
         table = self.query_one("#session-phase-table", DataTable)
         table.clear()
@@ -1180,6 +1763,11 @@ class DashboardScreen(Screen):
 
     def on_mount(self) -> None:
         self.query_one(StatusSidebar).refresh_stats()
+        if _schema_outdated():
+            self.notify(
+                "Schema changed — run full backfill: `python3 sdlc_extract.py --full` and `--enrich-only`.",
+                severity="warning",
+            )
 
     def on_screen_resume(self) -> None:
         self.query_one(StatusSidebar).refresh_stats()
@@ -1236,6 +1824,19 @@ class DashboardScreen(Screen):
             db.set_meta("last_run", datetime.now(timezone.utc).isoformat())
             db.set_meta("sessions_processed", str(stats["processed"]))
             db.set_meta("sessions_skipped", str(stats["skipped"]))
+            row = db.conn.execute(
+                "SELECT SUM(CASE WHEN phase='Code' THEN 1 ELSE 0 END), COUNT(*) FROM session_events"
+            ).fetchone()
+            code_events = int((row[0] if row else 0) or 0)
+            all_events = int((row[1] if row else 0) or 0)
+            default_code_rate = (code_events / all_events) if all_events else 0.0
+            db.set_meta("schema_version", SCHEMA_VERSION)
+            db.set_meta("default_code_rate", f"{default_code_rate:.4f}")
+            db.set_meta("github_enrich_errors", "0")
+            prev_enrich = db.conn.execute(
+                "SELECT value FROM extraction_meta WHERE key = 'github_enrich_last_run'"
+            ).fetchone()
+            db.set_meta("github_enrich_last_run", (prev_enrich[0] if prev_enrich else ""))
             db.commit()
 
             if stats["total"] == 0:
@@ -1366,6 +1967,14 @@ class SdlcApp(App):
     #button-bar {
         height: auto;
         margin-top: 1;
+    }
+    #scope-row {
+        height: auto;
+        padding: 0 2;
+    }
+    #scope-select {
+        width: 28;
+        margin-left: 1;
     }
     StatsScreen TabbedContent {
         height: 1fr;

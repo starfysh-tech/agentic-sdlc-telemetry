@@ -20,7 +20,6 @@ sdlc-t = "manage:main"
 Repository = "https://github.com/starfysh-tech/agentic-sdlc-telemetry"
 
 [tool.setuptools]
-py-modules = ["manage", "sdlc_extract"]
+py-modules = ["manage", "sdlc_extract", "github_enrich"]
 
 [tool.setuptools_scm]
-

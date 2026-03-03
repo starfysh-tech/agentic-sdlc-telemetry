@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import sqlite3
 import sys
@@ -17,6 +18,7 @@ from collections import defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
 
+SCHEMA_VERSION = "3"
 
 # ============================================================
 # Database
@@ -76,6 +78,48 @@ CREATE TABLE IF NOT EXISTS pr_links (
     UNIQUE (session_id, pr_number)
 );
 
+CREATE TABLE IF NOT EXISTS pr_facts (
+    pr_url         TEXT PRIMARY KEY,
+    repo_full_name TEXT NOT NULL,
+    pr_number      INTEGER NOT NULL,
+    state          TEXT,
+    is_merged      INTEGER,
+    opened_at      TEXT,
+    closed_at      TEXT,
+    merged_at      TEXT,
+    merge_commit_sha TEXT,
+    author_login   TEXT,
+    base_branch    TEXT,
+    head_branch    TEXT,
+    last_synced_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS pr_commits_final (
+    pr_url          TEXT NOT NULL,
+    repo_full_name  TEXT NOT NULL,
+    pr_number       INTEGER NOT NULL,
+    commit_sha      TEXT NOT NULL,
+    authored_at     TEXT,
+    committed_at    TEXT,
+    author_login    TEXT,
+    committer_login TEXT,
+    message_subject TEXT,
+    last_synced_at  TEXT NOT NULL,
+    PRIMARY KEY (pr_url, commit_sha)
+);
+
+CREATE TABLE IF NOT EXISTS pr_commit_events (
+    event_id        TEXT PRIMARY KEY,
+    pr_url          TEXT NOT NULL,
+    repo_full_name  TEXT NOT NULL,
+    pr_number       INTEGER NOT NULL,
+    commit_sha      TEXT,
+    event_type      TEXT NOT NULL,
+    event_at        TEXT,
+    actor_login     TEXT,
+    last_synced_at  TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS extraction_meta (
     key   TEXT PRIMARY KEY,
     value TEXT
@@ -88,6 +132,11 @@ CREATE INDEX IF NOT EXISTS idx_sessions_subagent  ON sessions(is_subagent);
 CREATE INDEX IF NOT EXISTS idx_git_ops_session    ON git_operations(session_id);
 CREATE INDEX IF NOT EXISTS idx_git_ops_type       ON git_operations(git_op_type);
 CREATE INDEX IF NOT EXISTS idx_pr_links_pr        ON pr_links(pr_number);
+CREATE INDEX IF NOT EXISTS idx_pr_facts_repo_number ON pr_facts(repo_full_name, pr_number);
+CREATE INDEX IF NOT EXISTS idx_pr_facts_merged_at   ON pr_facts(merged_at);
+CREATE INDEX IF NOT EXISTS idx_pr_commits_final_pr ON pr_commits_final(pr_url);
+CREATE INDEX IF NOT EXISTS idx_pr_commit_events_pr_time ON pr_commit_events(pr_url, event_at);
+CREATE INDEX IF NOT EXISTS idx_pr_commit_events_sha ON pr_commit_events(commit_sha);
 
 CREATE TABLE IF NOT EXISTS session_events (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -109,7 +158,17 @@ class DB:
     def __init__(self, path: Path):
         self.conn = sqlite3.connect(str(path))
         self.conn.executescript(_SCHEMA)
+        self._migrate_schema()
         self.conn.commit()
+
+    def _migrate_schema(self) -> None:
+        self._ensure_column("pr_facts", "merge_commit_sha", "TEXT")
+
+    def _ensure_column(self, table: str, column: str, ddl: str) -> None:
+        cols = self.conn.execute(f"PRAGMA table_info({table})").fetchall()
+        if any(str(col[1]) == column for col in cols):
+            return
+        self.conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {ddl}")
 
     def get_file_meta(self, source_file: str):
         """Returns (file_size_bytes, file_mtime, session_id) or None."""
@@ -156,6 +215,60 @@ class DB:
                  lnk.get("pr_repository"), lnk.get("timestamp"))
                 for lnk in links
             ],
+        )
+
+    def iter_pr_links(self, limit: int | None = None, scope: str = "all_activity"):
+        query = (
+            "SELECT pl.pr_url, pl.pr_repository, pl.pr_number, s.git_branch "
+            "FROM pr_links pl "
+            "JOIN sessions s ON s.session_id = pl.session_id "
+            "WHERE pl.pr_url IS NOT NULL AND pl.pr_url != ''"
+        )
+        params: list[object] = []
+        if scope == "delivery_only":
+            query += " AND s.is_subagent = 0"
+        query += " ORDER BY pl.timestamp DESC"
+        if limit is not None:
+            query += " LIMIT ?"
+            params.append(limit)
+        return self.conn.execute(query, params)
+
+    def upsert_pr_fact(self, fact: dict) -> None:
+        self.conn.execute(
+            "INSERT OR REPLACE INTO pr_facts "
+            "(pr_url, repo_full_name, pr_number, state, is_merged, opened_at, closed_at, "
+            "merged_at, merge_commit_sha, author_login, base_branch, head_branch, last_synced_at) "
+            "VALUES (:pr_url, :repo_full_name, :pr_number, :state, :is_merged, :opened_at, "
+            ":closed_at, :merged_at, :merge_commit_sha, :author_login, :base_branch, :head_branch, :last_synced_at)",
+            fact,
+        )
+
+    def replace_pr_commits_final(self, pr_url: str, rows: list[dict]) -> None:
+        self.conn.execute("DELETE FROM pr_commits_final WHERE pr_url = ?", (pr_url,))
+        if not rows:
+            return
+        self.conn.executemany(
+            "INSERT INTO pr_commits_final "
+            "(pr_url, repo_full_name, pr_number, commit_sha, authored_at, committed_at, "
+            "author_login, committer_login, message_subject, last_synced_at) "
+            "VALUES (:pr_url, :repo_full_name, :pr_number, :commit_sha, :authored_at, :committed_at, "
+            ":author_login, :committer_login, :message_subject, :last_synced_at)",
+            rows,
+        )
+
+    def clear_pr_commit_events_for_pr(self, pr_url: str) -> None:
+        self.conn.execute("DELETE FROM pr_commit_events WHERE pr_url = ?", (pr_url,))
+
+    def upsert_pr_commit_events(self, rows: list[dict]) -> None:
+        if not rows:
+            return
+        self.conn.executemany(
+            "INSERT OR REPLACE INTO pr_commit_events "
+            "(event_id, pr_url, repo_full_name, pr_number, commit_sha, event_type, event_at, "
+            "actor_login, last_synced_at) "
+            "VALUES (:event_id, :pr_url, :repo_full_name, :pr_number, :commit_sha, :event_type, :event_at, "
+            ":actor_login, :last_synced_at)",
+            rows,
         )
 
     def insert_events(self, events: list[dict]) -> None:
@@ -248,6 +361,7 @@ class GitOpExtractor:
 # ============================================================
 
 _DISCOVER = frozenset({
+    "Read", "Grep", "Glob", "LS", "NotebookRead",
     "WebSearch", "WebFetch", "ListMcpResourcesTool", "ReadMcpResourceTool",
 })
 
@@ -267,6 +381,8 @@ _TEST_RE = re.compile(
     re.IGNORECASE,
 )
 _REVIEW_RE = re.compile(r"gh\s+pr\s+(review|comment|view)\b", re.IGNORECASE)
+_REVIEW_AGENT_RE = re.compile(r"review|reviewer|audit|qa", re.IGNORECASE)
+_REVIEW_SKILL_RE = re.compile(r"review|audit|lint|security", re.IGNORECASE)
 
 
 def classify_tool(tool_name: str, tool_input: dict) -> str:
@@ -280,8 +396,16 @@ def classify_tool(tool_name: str, tool_input: dict) -> str:
             return "Review"
         if _DELIVER_RE.search(cmd):
             return "Deliver"
-    if tool_name in {"Agent", "Skill"}:
-        return "Review"
+    if tool_name == "Agent":
+        subagent_type = str(inp.get("subagent_type") or inp.get("agent_type") or "")
+        if _REVIEW_AGENT_RE.search(subagent_type):
+            return "Review"
+        return "Code"
+    if tool_name == "Skill":
+        skill_name = str(inp.get("skill") or inp.get("name") or "")
+        if _REVIEW_SKILL_RE.search(skill_name):
+            return "Review"
+        return "Code"
     if tool_name in _PLAN:
         return "Plan"
     if tool_name in _DISCOVER:
@@ -430,8 +554,16 @@ class SessionExtractor:
 
             if etype == "system":
                 if not perm_mode:
-                    # permissionMode may be top-level or inside content dict
+                    # permissionMode can appear in multiple event shapes.
                     perm_mode = ev.get("permissionMode")
+                    if not perm_mode:
+                        msg = ev.get("message")
+                        if isinstance(msg, dict):
+                            perm_mode = msg.get("permissionMode")
+                    if not perm_mode:
+                        snap = ev.get("snapshot")
+                        if isinstance(snap, dict):
+                            perm_mode = snap.get("permissionMode")
                     if not perm_mode:
                         content = ev.get("content")
                         if isinstance(content, dict):
@@ -645,42 +777,132 @@ def main():
         "--project-dirs", nargs="+", metavar="DIR",
         help="Project directories to process (default: all dirs in ~/.claude/projects/)"
     )
+    ap.add_argument("--enrich-only", action="store_true", help="Only sync PR data from GitHub")
+    ap.add_argument(
+        "--github-token-env",
+        default="GITHUB_TOKEN",
+        help="Environment variable name that contains GitHub token (default: GITHUB_TOKEN)",
+    )
+    ap.add_argument(
+        "--github-max-prs",
+        type=int,
+        default=500,
+        help="Max PR links to enrich per run (default: 500)",
+    )
+    ap.add_argument(
+        "--scope",
+        choices=("all_activity", "delivery_only"),
+        default="all_activity",
+        help="Scope for enrichment and metrics metadata (default: all_activity)",
+    )
     args = ap.parse_args()
 
     db_path = Path(args.db)
     db_path.parent.mkdir(parents=True, exist_ok=True)
 
-    if args.project_dirs:
-        project_dirs = [Path(d) for d in args.project_dirs]
-    else:
-        base = Path.home() / ".claude" / "projects"
-        project_dirs = sorted(d for d in base.iterdir() if d.is_dir()) if base.exists() else []
-
-    if not project_dirs:
-        print("ERROR: No project directories found.", file=sys.stderr)
-        sys.exit(1)
-
-    if args.verbose:
-        print(f"DB: {db_path}", file=sys.stderr)
-        for d in project_dirs:
-            print(f"  dir: {d}", file=sys.stderr)
-
     db = DB(db_path)
-    extractor = SessionExtractor(db, verbose=args.verbose)
-    stats = extractor.run(project_dirs, full=args.full)
-    facet_count = extractor.load_facets()
+    try:
+        extractor = SessionExtractor(db, verbose=args.verbose)
+        stats = {"processed": 0, "skipped": 0, "errors": 0, "total": 0}
+        facet_count = 0
 
-    db.set_meta("last_run", datetime.now(timezone.utc).isoformat())
-    db.set_meta("sessions_processed", str(stats["processed"]))
-    db.set_meta("sessions_skipped", str(stats["skipped"]))
-    db.commit()
+        if not args.enrich_only:
+            if args.project_dirs:
+                project_dirs = [Path(d) for d in args.project_dirs]
+            else:
+                base = Path.home() / ".claude" / "projects"
+                project_dirs = sorted(d for d in base.iterdir() if d.is_dir()) if base.exists() else []
 
-    print(
-        f"Extracted {stats['processed']} sessions "
-        f"({stats['skipped']} unchanged, {stats['errors']} errors). "
-        f"Facets: {facet_count}. DB: {db_path}"
-    )
-    db.close()
+            if not project_dirs:
+                print("ERROR: No project directories found.", file=sys.stderr)
+                sys.exit(1)
+
+            if args.verbose:
+                print(f"DB: {db_path}", file=sys.stderr)
+                for d in project_dirs:
+                    print(f"  dir: {d}", file=sys.stderr)
+
+            stats = extractor.run(project_dirs, full=args.full)
+            facet_count = extractor.load_facets()
+            db.set_meta("last_run", datetime.now(timezone.utc).isoformat())
+            db.set_meta("sessions_processed", str(stats["processed"]))
+            db.set_meta("sessions_skipped", str(stats["skipped"]))
+
+        enrich_stats = {
+            "attempted": 0,
+            "updated": 0,
+            "errors": 0,
+            "commit_errors": 0,
+            "commits_final": 0,
+            "commit_events": 0,
+            "skipped": True,
+        }
+        token = None
+        token_name = args.github_token_env
+        if token_name:
+            token = os.environ.get(token_name)
+        if token:
+            try:
+                from github_enrich import sync_pr_facts
+                enrich_stats = sync_pr_facts(
+                    db=db,
+                    token=token,
+                    max_prs=args.github_max_prs,
+                    scope=args.scope,
+                    verbose=args.verbose,
+                )
+            except Exception as exc:  # pragma: no cover - defensive safety
+                enrich_stats = {
+                    "attempted": 0,
+                    "updated": 0,
+                    "errors": 1,
+                    "commit_errors": 1,
+                    "commits_final": 0,
+                    "commit_events": 0,
+                    "skipped": False,
+                }
+                if args.verbose:
+                    print(f"GitHub enrichment failed: {exc}", file=sys.stderr)
+        elif args.enrich_only and args.verbose:
+            print(f"Skipping GitHub enrichment: {token_name} not set", file=sys.stderr)
+
+        row = db.conn.execute(
+            "SELECT SUM(CASE WHEN phase='Code' THEN 1 ELSE 0 END), COUNT(*) FROM session_events"
+        ).fetchone()
+        code_events = int(row[0] or 0)
+        all_events = int(row[1] or 0)
+        default_code_rate = (code_events / all_events) if all_events else 0.0
+
+        db.set_meta("schema_version", SCHEMA_VERSION)
+        db.set_meta("default_code_rate", f"{default_code_rate:.4f}")
+        now_iso = datetime.now(timezone.utc).isoformat()
+        db.set_meta("github_enrich_last_run", now_iso)
+        db.set_meta("github_enrich_errors", str(int(enrich_stats.get("errors", 0))))
+        db.set_meta("github_enrich_commit_last_run", now_iso)
+        db.set_meta("github_enrich_commit_errors", str(int(enrich_stats.get("commit_errors", 0))))
+        db.commit()
+
+        if args.enrich_only:
+            print(
+                f"Enriched PR facts: {enrich_stats.get('updated', 0)} "
+                f"(attempted {enrich_stats.get('attempted', 0)}, errors {enrich_stats.get('errors', 0)}). "
+                f"Commits: {enrich_stats.get('commits_final', 0)}, "
+                f"commit events: {enrich_stats.get('commit_events', 0)}. "
+                f"DB: {db_path}"
+            )
+        else:
+            print(
+                f"Extracted {stats['processed']} sessions "
+                f"({stats['skipped']} unchanged, {stats['errors']} errors). "
+                f"Facets: {facet_count}. "
+                f"Enriched PR facts: {enrich_stats.get('updated', 0)} "
+                f"(attempted {enrich_stats.get('attempted', 0)}, errors {enrich_stats.get('errors', 0)}). "
+                f"Commits: {enrich_stats.get('commits_final', 0)}, "
+                f"commit events: {enrich_stats.get('commit_events', 0)}. "
+                f"DB: {db_path}"
+            )
+    finally:
+        db.close()
 
 
 if __name__ == "__main__":
