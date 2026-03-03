@@ -2431,11 +2431,14 @@ class DashboardScreen(Screen):
             default_code_rate = (code_events / all_events) if all_events else 0.0
             db.set_meta("schema_version", SCHEMA_VERSION)
             db.set_meta("default_code_rate", f"{default_code_rate:.4f}")
-            db.set_meta("github_enrich_errors", "0")
-            prev_enrich = db.conn.execute(
-                "SELECT value FROM extraction_meta WHERE key = 'github_enrich_last_run'"
-            ).fetchone()
-            db.set_meta("github_enrich_last_run", (prev_enrich[0] if prev_enrich else ""))
+            for key in [
+                "github_enrich_last_run",
+                "github_enrich_errors",
+                "github_enrich_commit_last_run",
+                "github_enrich_commit_errors",
+            ]:
+                row = db.conn.execute("SELECT value FROM extraction_meta WHERE key = ?", (key,)).fetchone()
+                db.set_meta(key, row[0] if row else "")
             db.commit()
 
             if stats["total"] == 0:
