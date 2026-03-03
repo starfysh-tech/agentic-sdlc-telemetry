@@ -29,6 +29,26 @@ Stats support two scopes:
 
 Stats now include a **PR Commit Timing** view with pre-vs-post PR-open commit counts, post-open ratio, and confidence bands.
 
+### CLI Mode (for automation/AI)
+
+Use `--cli` to emit JSON instead of launching the TUI:
+
+```bash
+sdlc-t --cli
+```
+
+Filter by scope and one or more repos:
+
+```bash
+sdlc-t --cli --scope delivery_only --repo mqol-inc/aerie --repo starfysh-tech/cc-hooks-metrics --limit 20
+```
+
+Compact JSON output:
+
+```bash
+sdlc-t --cli --compact
+```
+
 ## Menu
 
 | Option | Description |

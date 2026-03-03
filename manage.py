@@ -13,6 +13,7 @@ import sys
 import time
 import urllib.error
 import urllib.request
+from datetime import datetime, timezone
 from importlib.metadata import PackageNotFoundError
 from importlib.metadata import version as _pkg_version
 from pathlib import Path
@@ -409,6 +410,251 @@ def _pr_coverage(conn: sqlite3.Connection, scope: Scope) -> tuple[int, int]:
 def _schema_outdated() -> bool:
     v = _get_meta("schema_version")
     return bool(DB_FILE.exists() and v != SCHEMA_VERSION)
+
+
+def _normalize_repo_filters(repos: list[str] | None) -> list[str]:
+    if not repos:
+        return []
+    cleaned: list[str] = []
+    seen: set[str] = set()
+    for repo in repos:
+        v = str(repo or "").strip().lower()
+        if not v or v in seen:
+            continue
+        seen.add(v)
+        cleaned.append(v)
+    return cleaned
+
+
+def get_cli_snapshot(
+    scope: Scope = "all_activity",
+    repos: list[str] | None = None,
+    limit: int = 10,
+) -> dict:
+    repos_norm = _normalize_repo_filters(repos)
+    row_limit = max(int(limit), 1)
+    snapshot = {
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "scope": scope,
+        "source_db": str(DB_FILE),
+        "filters": {"repos": repos_norm},
+        "overview": {
+            "total_prs": 0,
+            "prs_with_facts": 0,
+            "prs_merged": 0,
+            "repo_count": 0,
+        },
+        "commit_timing_summary": {
+            "avg_pre": 0.0,
+            "avg_post": 0.0,
+            "post_ratio": 0.0,
+            "coverage_num": 0,
+            "coverage_den": 0,
+            "confidence": "LOW",
+        },
+        "repo_summary": [],
+        "post_open_outliers": [],
+        "recent_prs": [],
+    }
+    if not DB_FILE.exists():
+        snapshot["error"] = "database_not_found"
+        return snapshot
+
+    placeholders = ",".join("?" for _ in repos_norm)
+    repo_filter_links = ""
+    repo_filter_rollup = ""
+    repo_params: list[object] = []
+    if repos_norm:
+        repo_filter_links = (
+            " AND lower(COALESCE(pf.repo_full_name, pl.pr_repository)) "
+            f"IN ({placeholders})"
+        )
+        repo_filter_rollup = f" AND lower(repo_full_name) IN ({placeholders})"
+        repo_params = list(repos_norm)
+
+    try:
+        with sqlite3.connect(DB_FILE) as conn:
+            overview = conn.execute(
+                f"""
+                WITH scoped_prs AS (
+                    SELECT DISTINCT
+                        pl.pr_url,
+                        COALESCE(pf.repo_full_name, pl.pr_repository) AS repo_name,
+                        pf.pr_url AS fact_url,
+                        pf.is_merged AS is_merged
+                    FROM pr_links pl
+                    JOIN sessions s ON s.session_id = pl.session_id
+                    LEFT JOIN pr_facts pf ON pf.pr_url = pl.pr_url
+                    WHERE pl.pr_url IS NOT NULL
+                      AND pl.pr_url != ''
+                      AND {_scope_clause(scope, 's')}
+                      {repo_filter_links}
+                )
+                SELECT
+                    COUNT(*) AS total_prs,
+                    SUM(CASE WHEN fact_url IS NOT NULL THEN 1 ELSE 0 END) AS prs_with_facts,
+                    SUM(CASE WHEN is_merged = 1 THEN 1 ELSE 0 END) AS prs_merged,
+                    COUNT(DISTINCT repo_name) AS repo_count
+                FROM scoped_prs
+                """,
+                repo_params,
+            ).fetchone()
+            total_prs = int((overview[0] if overview else 0) or 0)
+            prs_with_facts = int((overview[1] if overview else 0) or 0)
+            prs_merged = int((overview[2] if overview else 0) or 0)
+            repo_count = int((overview[3] if overview else 0) or 0)
+            snapshot["overview"] = {
+                "total_prs": total_prs,
+                "prs_with_facts": prs_with_facts,
+                "prs_merged": prs_merged,
+                "repo_count": repo_count,
+            }
+
+            summary = conn.execute(
+                _pr_commit_rollup_sql(scope)
+                + f"""
+                SELECT
+                    COALESCE(AVG(CASE WHEN confidence != 'LOW' THEN pre_commits END), 0),
+                    COALESCE(AVG(CASE WHEN confidence != 'LOW' THEN post_commits END), 0),
+                    COALESCE(
+                        SUM(CASE WHEN confidence != 'LOW' THEN post_commits ELSE 0 END) * 1.0
+                        / NULLIF(
+                            SUM(CASE WHEN confidence != 'LOW' THEN (pre_commits + post_commits) ELSE 0 END),
+                            0
+                        ),
+                        0.0
+                    ),
+                    SUM(CASE WHEN confidence != 'LOW' THEN 1 ELSE 0 END),
+                    COUNT(*)
+                FROM rollup
+                WHERE 1=1
+                {repo_filter_rollup}
+                """,
+                repo_params,
+            ).fetchone()
+            cov_num = int((summary[3] if summary else 0) or 0)
+            cov_den = int((summary[4] if summary else 0) or 0)
+            snapshot["commit_timing_summary"] = {
+                "avg_pre": float((summary[0] if summary else 0) or 0),
+                "avg_post": float((summary[1] if summary else 0) or 0),
+                "post_ratio": float((summary[2] if summary else 0) or 0),
+                "coverage_num": cov_num,
+                "coverage_den": cov_den,
+                "confidence": _confidence_label(cov_num, cov_den),
+            }
+
+            repo_rows = conn.execute(
+                _pr_commit_rollup_sql(scope)
+                + f"""
+                SELECT
+                    COALESCE(NULLIF(repo_full_name, ''), '<unknown>') AS repo_name,
+                    COUNT(*) AS prs,
+                    SUM(CASE WHEN confidence != 'LOW' THEN 1 ELSE 0 END) AS covered,
+                    SUM(CASE WHEN confidence = 'HIGH' THEN 1 ELSE 0 END) AS high_count,
+                    SUM(CASE WHEN confidence = 'MED' THEN 1 ELSE 0 END) AS med_count,
+                    SUM(CASE WHEN confidence = 'LOW' THEN 1 ELSE 0 END) AS low_count,
+                    COALESCE(AVG(CASE WHEN confidence != 'LOW' THEN pre_commits END), 0),
+                    COALESCE(AVG(CASE WHEN confidence != 'LOW' THEN post_commits END), 0),
+                    COALESCE(
+                        SUM(CASE WHEN confidence != 'LOW' THEN post_commits ELSE 0 END) * 1.0
+                        / NULLIF(
+                            SUM(CASE WHEN confidence != 'LOW' THEN (pre_commits + post_commits) ELSE 0 END),
+                            0
+                        ),
+                        0.0
+                    ) AS post_ratio
+                FROM rollup
+                WHERE 1=1
+                {repo_filter_rollup}
+                GROUP BY COALESCE(NULLIF(repo_full_name, ''), '<unknown>')
+                ORDER BY prs DESC, post_ratio DESC, repo_name ASC
+                LIMIT ?
+                """,
+                [*repo_params, row_limit],
+            ).fetchall()
+            snapshot["repo_summary"] = [
+                {
+                    "repo": str(r[0]),
+                    "prs": int(r[1] or 0),
+                    "covered_prs": int(r[2] or 0),
+                    "confidence": _confidence_label(int(r[2] or 0), int(r[1] or 0)),
+                    "high_count": int(r[3] or 0),
+                    "med_count": int(r[4] or 0),
+                    "low_count": int(r[5] or 0),
+                    "avg_pre": float(r[6] or 0),
+                    "avg_post": float(r[7] or 0),
+                    "post_ratio": float(r[8] or 0),
+                }
+                for r in repo_rows
+            ]
+
+            outlier_rows = conn.execute(
+                _pr_commit_rollup_sql(scope)
+                + f"""
+                SELECT
+                    pr_number,
+                    COALESCE(NULLIF(repo_full_name, ''), '<unknown>') AS repo_name,
+                    opened_at,
+                    merged_at,
+                    pre_commits,
+                    post_commits,
+                    CASE
+                        WHEN (pre_commits + post_commits) > 0
+                        THEN (post_commits * 100.0) / (pre_commits + post_commits)
+                        ELSE 0
+                    END AS post_pct,
+                    confidence
+                FROM rollup
+                WHERE confidence != 'LOW'
+                {repo_filter_rollup}
+                ORDER BY post_commits DESC, post_pct DESC, opened_at DESC
+                LIMIT ?
+                """,
+                [*repo_params, row_limit],
+            ).fetchall()
+            snapshot["post_open_outliers"] = [
+                {
+                    "pr_number": int(r[0] or 0),
+                    "repo": str(r[1] or ""),
+                    "opened_at": r[2],
+                    "merged_at": r[3],
+                    "pre_commits": int(r[4] or 0),
+                    "post_commits": int(r[5] or 0),
+                    "post_pct": float(r[6] or 0),
+                    "confidence": str(r[7] or "LOW"),
+                }
+                for r in outlier_rows
+            ]
+
+            recent_rows = conn.execute(
+                f"""
+                SELECT
+                    substr(COALESCE(pf.opened_at, pl.timestamp), 1, 19),
+                    COALESCE(pf.pr_number, pl.pr_number),
+                    COALESCE(pf.repo_full_name, pl.pr_repository),
+                    s.git_branch
+                FROM pr_links pl
+                JOIN sessions s ON s.session_id = pl.session_id
+                LEFT JOIN pr_facts pf ON pf.pr_url = pl.pr_url
+                WHERE {_scope_clause(scope, 's')}
+                {repo_filter_links}
+                ORDER BY COALESCE(pf.opened_at, pl.timestamp) DESC
+                LIMIT ?
+                """,
+                [*repo_params, row_limit],
+            ).fetchall()
+            snapshot["recent_prs"] = [
+                {
+                    "timestamp": r[0],
+                    "pr_number": int(r[1] or 0),
+                    "repo": str(r[2] or ""),
+                    "branch": str(r[3] or ""),
+                }
+                for r in recent_rows
+            ]
+    except sqlite3.Error as exc:
+        snapshot["error"] = f"sqlite_error: {exc}"
+    return snapshot
 
 def get_velocity_banner(scope: Scope = "all_activity") -> dict:
     if not DB_FILE.exists():
@@ -2028,7 +2274,46 @@ def main() -> None:
         description="SDLC session analytics for Claude Code",
     )
     ap.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
-    ap.parse_args()
+    ap.add_argument(
+        "--cli",
+        action="store_true",
+        help="Emit JSON telemetry snapshot for automation/AI usage (non-interactive).",
+    )
+    ap.add_argument(
+        "--scope",
+        choices=("all_activity", "delivery_only"),
+        default="all_activity",
+        help="Scope for --cli output (default: all_activity).",
+    )
+    ap.add_argument(
+        "--repo",
+        action="append",
+        dest="repos",
+        help="Filter --cli output to repository full name (owner/name). Repeat for multiple repos.",
+    )
+    ap.add_argument(
+        "--limit",
+        type=int,
+        default=10,
+        help="Row limit for --cli tables (default: 10).",
+    )
+    ap.add_argument(
+        "--compact",
+        action="store_true",
+        help="Emit compact JSON for --cli output.",
+    )
+    args = ap.parse_args()
+    if args.cli:
+        payload = get_cli_snapshot(
+            scope=args.scope,  # type: ignore[arg-type]
+            repos=args.repos,
+            limit=args.limit,
+        )
+        if args.compact:
+            print(json.dumps(payload, separators=(",", ":")))
+        else:
+            print(json.dumps(payload, indent=2))
+        return
     SdlcApp().run()
 
 if __name__ == "__main__":
