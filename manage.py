@@ -13,6 +13,7 @@ import sys
 import time
 import urllib.error
 import urllib.request
+from datetime import datetime, timezone
 from importlib.metadata import PackageNotFoundError
 from importlib.metadata import version as _pkg_version
 from pathlib import Path
@@ -409,6 +410,610 @@ def _pr_coverage(conn: sqlite3.Connection, scope: Scope) -> tuple[int, int]:
 def _schema_outdated() -> bool:
     v = _get_meta("schema_version")
     return bool(DB_FILE.exists() and v != SCHEMA_VERSION)
+
+def _normalize_repo_filters(repos: list[str] | None) -> list[str]:
+    if not repos:
+        return []
+    cleaned: list[str] = []
+    seen: set[str] = set()
+    for repo in repos:
+        v = str(repo or "").strip().lower()
+        if not v or v in seen:
+            continue
+        seen.add(v)
+        cleaned.append(v)
+    return cleaned
+
+
+def get_cli_snapshot(
+    scope: Scope = "all_activity",
+    repos: list[str] | None = None,
+    limit: int = 10,
+) -> dict:
+    repos_norm = _normalize_repo_filters(repos)
+    row_limit = max(int(limit), 1)
+    snapshot = {
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "scope": scope,
+        "source_db": str(DB_FILE),
+        "filters": {"repos": repos_norm},
+        "overview": {
+            "total_prs": 0,
+            "prs_with_facts": 0,
+            "prs_merged": 0,
+            "repo_count": 0,
+        },
+        "commit_timing_summary": {
+            "avg_pre": 0.0,
+            "avg_post": 0.0,
+            "post_ratio": 0.0,
+            "coverage_num": 0,
+            "coverage_den": 0,
+            "confidence": "LOW",
+        },
+        "repo_summary": [],
+        "post_open_outliers": [],
+        "recent_prs": [],
+    }
+    if not DB_FILE.exists():
+        snapshot["error"] = "database_not_found"
+        return snapshot
+
+    placeholders = ",".join("?" for _ in repos_norm)
+    repo_filter_links = ""
+    repo_filter_rollup = ""
+    repo_params: list[object] = []
+    if repos_norm:
+        repo_filter_links = (
+            " AND lower(COALESCE(pf.repo_full_name, pl.pr_repository)) "
+            f"IN ({placeholders})"
+        )
+        repo_filter_rollup = f" AND lower(repo_full_name) IN ({placeholders})"
+        repo_params = list(repos_norm)
+
+    try:
+        with sqlite3.connect(DB_FILE) as conn:
+            overview = conn.execute(
+                f"""
+                WITH scoped_prs AS (
+                    SELECT DISTINCT
+                        pl.pr_url,
+                        COALESCE(pf.repo_full_name, pl.pr_repository) AS repo_name,
+                        pf.pr_url AS fact_url,
+                        pf.is_merged AS is_merged
+                    FROM pr_links pl
+                    JOIN sessions s ON s.session_id = pl.session_id
+                    LEFT JOIN pr_facts pf ON pf.pr_url = pl.pr_url
+                    WHERE pl.pr_url IS NOT NULL
+                      AND pl.pr_url != ''
+                      AND {_scope_clause(scope, 's')}
+                      {repo_filter_links}
+                )
+                SELECT
+                    COUNT(*) AS total_prs,
+                    SUM(CASE WHEN fact_url IS NOT NULL THEN 1 ELSE 0 END) AS prs_with_facts,
+                    SUM(CASE WHEN is_merged = 1 THEN 1 ELSE 0 END) AS prs_merged,
+                    COUNT(DISTINCT repo_name) AS repo_count
+                FROM scoped_prs
+                """,
+                repo_params,
+            ).fetchone()
+            total_prs = int((overview[0] if overview else 0) or 0)
+            prs_with_facts = int((overview[1] if overview else 0) or 0)
+            prs_merged = int((overview[2] if overview else 0) or 0)
+            repo_count = int((overview[3] if overview else 0) or 0)
+            snapshot["overview"] = {
+                "total_prs": total_prs,
+                "prs_with_facts": prs_with_facts,
+                "prs_merged": prs_merged,
+                "repo_count": repo_count,
+            }
+
+            summary = conn.execute(
+                _pr_commit_rollup_sql(scope)
+                + f"""
+                SELECT
+                    COALESCE(AVG(CASE WHEN confidence != 'LOW' THEN pre_commits END), 0),
+                    COALESCE(AVG(CASE WHEN confidence != 'LOW' THEN post_commits END), 0),
+                    COALESCE(
+                        SUM(CASE WHEN confidence != 'LOW' THEN post_commits ELSE 0 END) * 1.0
+                        / NULLIF(
+                            SUM(CASE WHEN confidence != 'LOW' THEN (pre_commits + post_commits) ELSE 0 END),
+                            0
+                        ),
+                        0.0
+                    ),
+                    SUM(CASE WHEN confidence != 'LOW' THEN 1 ELSE 0 END),
+                    COUNT(*)
+                FROM rollup
+                WHERE 1=1
+                {repo_filter_rollup}
+                """,
+                repo_params,
+            ).fetchone()
+            cov_num = int((summary[3] if summary else 0) or 0)
+            cov_den = int((summary[4] if summary else 0) or 0)
+            snapshot["commit_timing_summary"] = {
+                "avg_pre": float((summary[0] if summary else 0) or 0),
+                "avg_post": float((summary[1] if summary else 0) or 0),
+                "post_ratio": float((summary[2] if summary else 0) or 0),
+                "coverage_num": cov_num,
+                "coverage_den": cov_den,
+                "confidence": _confidence_label(cov_num, cov_den),
+            }
+
+            repo_rows = conn.execute(
+                _pr_commit_rollup_sql(scope)
+                + f"""
+                SELECT
+                    COALESCE(NULLIF(repo_full_name, ''), '<unknown>') AS repo_name,
+                    COUNT(*) AS prs,
+                    SUM(CASE WHEN confidence != 'LOW' THEN 1 ELSE 0 END) AS covered,
+                    SUM(CASE WHEN confidence = 'HIGH' THEN 1 ELSE 0 END) AS high_count,
+                    SUM(CASE WHEN confidence = 'MED' THEN 1 ELSE 0 END) AS med_count,
+                    SUM(CASE WHEN confidence = 'LOW' THEN 1 ELSE 0 END) AS low_count,
+                    COALESCE(AVG(CASE WHEN confidence != 'LOW' THEN pre_commits END), 0),
+                    COALESCE(AVG(CASE WHEN confidence != 'LOW' THEN post_commits END), 0),
+                    COALESCE(
+                        SUM(CASE WHEN confidence != 'LOW' THEN post_commits ELSE 0 END) * 1.0
+                        / NULLIF(
+                            SUM(CASE WHEN confidence != 'LOW' THEN (pre_commits + post_commits) ELSE 0 END),
+                            0
+                        ),
+                        0.0
+                    ) AS post_ratio
+                FROM rollup
+                WHERE 1=1
+                {repo_filter_rollup}
+                GROUP BY COALESCE(NULLIF(repo_full_name, ''), '<unknown>')
+                ORDER BY prs DESC, post_ratio DESC, repo_name ASC
+                LIMIT ?
+                """,
+                [*repo_params, row_limit],
+            ).fetchall()
+            snapshot["repo_summary"] = [
+                {
+                    "repo": str(r[0]),
+                    "prs": int(r[1] or 0),
+                    "covered_prs": int(r[2] or 0),
+                    "confidence": _confidence_label(int(r[2] or 0), int(r[1] or 0)),
+                    "high_count": int(r[3] or 0),
+                    "med_count": int(r[4] or 0),
+                    "low_count": int(r[5] or 0),
+                    "avg_pre": float(r[6] or 0),
+                    "avg_post": float(r[7] or 0),
+                    "post_ratio": float(r[8] or 0),
+                }
+                for r in repo_rows
+            ]
+
+            outlier_rows = conn.execute(
+                _pr_commit_rollup_sql(scope)
+                + f"""
+                SELECT
+                    pr_number,
+                    COALESCE(NULLIF(repo_full_name, ''), '<unknown>') AS repo_name,
+                    opened_at,
+                    merged_at,
+                    pre_commits,
+                    post_commits,
+                    CASE
+                        WHEN (pre_commits + post_commits) > 0
+                        THEN (post_commits * 100.0) / (pre_commits + post_commits)
+                        ELSE 0
+                    END AS post_pct,
+                    confidence
+                FROM rollup
+                WHERE confidence != 'LOW'
+                {repo_filter_rollup}
+                ORDER BY post_commits DESC, post_pct DESC, opened_at DESC
+                LIMIT ?
+                """,
+                [*repo_params, row_limit],
+            ).fetchall()
+            snapshot["post_open_outliers"] = [
+                {
+                    "pr_number": int(r[0] or 0),
+                    "repo": str(r[1] or ""),
+                    "opened_at": r[2],
+                    "merged_at": r[3],
+                    "pre_commits": int(r[4] or 0),
+                    "post_commits": int(r[5] or 0),
+                    "post_pct": float(r[6] or 0),
+                    "confidence": str(r[7] or "LOW"),
+                }
+                for r in outlier_rows
+            ]
+
+            recent_rows = conn.execute(
+                f"""
+                SELECT
+                    substr(COALESCE(pf.opened_at, pl.timestamp), 1, 19),
+                    COALESCE(pf.pr_number, pl.pr_number),
+                    COALESCE(pf.repo_full_name, pl.pr_repository),
+                    s.git_branch
+                FROM pr_links pl
+                JOIN sessions s ON s.session_id = pl.session_id
+                LEFT JOIN pr_facts pf ON pf.pr_url = pl.pr_url
+                WHERE {_scope_clause(scope, 's')}
+                {repo_filter_links}
+                ORDER BY COALESCE(pf.opened_at, pl.timestamp) DESC
+                LIMIT ?
+                """,
+                [*repo_params, row_limit],
+            ).fetchall()
+            snapshot["recent_prs"] = [
+                {
+                    "timestamp": r[0],
+                    "pr_number": int(r[1] or 0),
+                    "repo": str(r[2] or ""),
+                    "branch": str(r[3] or ""),
+                }
+                for r in recent_rows
+            ]
+    except sqlite3.Error as exc:
+        snapshot["error"] = f"sqlite_error: {exc}"
+    return snapshot
+
+
+def _rows_to_dicts(rows: list[tuple], keys: tuple[str, ...]) -> list[dict]:
+    out: list[dict] = []
+    for row in rows:
+        out.append({k: row[i] if i < len(row) else None for i, k in enumerate(keys)})
+    return out
+
+
+def get_cli_tui_parity(scope: Scope = "all_activity", limit: int = 10) -> dict:
+    lim = max(int(limit), 1)
+    sessions = get_recent_sessions_for_select(limit=min(lim, 10), scope=scope)
+    session_breakdowns = []
+    for label, session_id in sessions[: min(len(sessions), 5)]:
+        session_breakdowns.append(
+            {
+                "label": label,
+                "session_id": session_id,
+                "pipeline": get_session_pipeline(session_id),
+            }
+        )
+    return {
+        "scope": scope,
+        "throughput": {
+            "velocity_banner": get_velocity_banner(scope),
+            "weekly_throughput": _rows_to_dicts(
+                get_weekly_throughput(weeks=lim, scope=scope),
+                ("week", "prs_created", "prs_merged", "commits", "avg_lead_hours"),
+            ),
+            "recent_prs": _rows_to_dicts(
+                get_recent_prs(limit=lim, scope=scope),
+                ("date", "pr_number", "repo_name", "branch"),
+            ),
+        },
+        "lead_time": {
+            "pr_lifecycle": _rows_to_dicts(
+                get_pr_lifecycle(limit=lim, scope=scope),
+                ("branch", "lead_time_hours", "sessions", "commits", "first_session_date", "pr_created_date", "confidence"),
+            ),
+            "rework_hotspots": _rows_to_dicts(
+                get_rework_hotspots(limit=lim, scope=scope),
+                ("branch", "sessions", "commits", "total_duration_s", "commits_per_session"),
+            ),
+        },
+        "pr_commit_timing": {
+            "summary": get_pr_commit_timing_summary(scope),
+            "outliers": _rows_to_dicts(
+                get_pr_post_open_commit_outliers(limit=lim, scope=scope),
+                ("pr_number", "repo", "opened_at", "merged_at", "pre_commits", "post_commits", "post_pct", "confidence"),
+            ),
+            "details": _rows_to_dicts(
+                get_pr_commit_timing_details(limit=lim, scope=scope),
+                ("pr_number", "repo", "opened_at", "merged_at", "pre_commits", "post_commits", "post_pct", "confidence"),
+            ),
+        },
+        "efficiency": {
+            "banner": get_efficiency_metrics(scope),
+            "model_efficiency": _rows_to_dicts(
+                get_model_efficiency(scope),
+                ("model", "sessions", "avg_duration_s", "commits", "tokens_per_commit"),
+            ),
+            "unproductive_sessions": _rows_to_dicts(
+                get_unproductive_sessions(limit=lim, scope=scope),
+                ("date", "duration_s", "model", "first_prompt"),
+            ),
+            "tool_usage": _rows_to_dicts(
+                get_tool_usage_enhanced(scope),
+                ("tool", "total_calls", "sessions", "avg_per_session"),
+            ),
+        },
+        "value_stream": {
+            "aggregate_pipeline": get_aggregate_pipeline(scope),
+            "default_code_rate": get_default_code_rate(scope),
+            "sample_session_breakdowns": session_breakdowns,
+        },
+    }
+
+
+def _extract_paths_from_project_names(project_values: list[str] | None) -> tuple[list[Path], list[str]]:
+    projects = get_project_list()
+    by_name = {str(p["name"]).lower(): p for p in projects}
+    by_display = {str(p["display"]).lower(): p for p in projects}
+    resolved_dirs: list[str] = []
+    unknown: list[str] = []
+    requested = project_values or []
+    for raw in requested:
+        key = str(raw or "").strip().lower()
+        if not key:
+            continue
+        p = by_name.get(key) or by_display.get(key)
+        if not p:
+            unknown.append(raw)
+            continue
+        for d in p.get("dirs", [p["name"]]):
+            if d not in resolved_dirs:
+                resolved_dirs.append(d)
+    return resolve_dirs(resolved_dirs), unknown
+
+
+def _perform_extraction(
+    dirs: list[Path],
+    *,
+    full: bool = False,
+    enrich: bool = False,
+    scope: Scope = "all_activity",
+    github_token_env: str = "GITHUB_TOKEN",
+    github_max_prs: int = 500,
+) -> dict:
+    DB_FILE.parent.mkdir(parents=True, exist_ok=True)
+    db = ExtractDB(DB_FILE)
+    try:
+        extractor = SessionExtractor(db, verbose=False)
+        stats = extractor.run([str(d) for d in dirs], full=full)
+        facets = extractor.load_facets()
+        db.set_meta("last_run", datetime.now(timezone.utc).isoformat())
+        db.set_meta("sessions_processed", str(stats["processed"]))
+        db.set_meta("sessions_skipped", str(stats["skipped"]))
+        row = db.conn.execute(
+            f"""
+            SELECT
+                SUM(CASE WHEN e.phase='Code' THEN 1 ELSE 0 END),
+                COUNT(*)
+            FROM session_events e
+            JOIN sessions s ON s.session_id = e.session_id
+            WHERE {_scope_clause(scope, 's')}
+            """
+        ).fetchone()
+        code_events = int((row[0] if row else 0) or 0)
+        all_events = int((row[1] if row else 0) or 0)
+        default_code_rate = (code_events / all_events) if all_events else 0.0
+        db.set_meta("schema_version", SCHEMA_VERSION)
+        db.set_meta("default_code_rate", f"{default_code_rate:.4f}")
+
+        enrich_stats = {
+            "attempted": 0,
+            "updated": 0,
+            "errors": 0,
+            "commit_errors": 0,
+            "commits_final": 0,
+            "commit_events": 0,
+            "skipped": True,
+        }
+        if enrich:
+            token = os.environ.get(github_token_env)
+            if token:
+                try:
+                    from github_enrich import sync_pr_facts
+                    enrich_stats = sync_pr_facts(
+                        db=db,
+                        token=token,
+                        max_prs=max(int(github_max_prs), 1),
+                        scope=scope,
+                        verbose=False,
+                    )
+                except Exception:
+                    enrich_stats = {
+                        "attempted": 0,
+                        "updated": 0,
+                        "errors": 1,
+                        "commit_errors": 1,
+                        "commits_final": 0,
+                        "commit_events": 0,
+                        "skipped": False,
+                    }
+            else:
+                enrich_stats = {
+                    "attempted": 0,
+                    "updated": 0,
+                    "errors": 0,
+                    "commit_errors": 0,
+                    "commits_final": 0,
+                    "commit_events": 0,
+                    "skipped": True,
+                    "reason": f"{github_token_env}_not_set",
+                }
+
+        now_iso = datetime.now(timezone.utc).isoformat()
+        db.set_meta("github_enrich_last_run", now_iso)
+        db.set_meta("github_enrich_errors", str(int(enrich_stats.get("errors", 0))))
+        db.set_meta("github_enrich_commit_last_run", now_iso)
+        db.set_meta("github_enrich_commit_errors", str(int(enrich_stats.get("commit_errors", 0))))
+        db.commit()
+        return {
+            "ok": True,
+            "stats": stats,
+            "facets_loaded": facets,
+            "default_code_rate": default_code_rate,
+            "enrich": enrich_stats,
+            "project_dirs": [str(d) for d in dirs],
+        }
+    finally:
+        db.close()
+
+
+def _check_for_update() -> dict:
+    if __version__ == "dev" or ".dev" in __version__:
+        return {
+            "ok": True,
+            "local_version": __version__,
+            "update_available": False,
+            "reason": "dev_install",
+        }
+    local_sha: str | None = None
+    if "+g" in __version__:
+        local_sha = __version__.split("+g")[1][:7]
+    req = urllib.request.Request(
+        GITHUB_API_URL,
+        headers={"Accept": "application/vnd.github.v3+json", "User-Agent": "sdlc-t"},
+    )
+    with urllib.request.urlopen(req, timeout=10) as resp:
+        data = json.loads(resp.read())
+    remote_sha = str(data["sha"])[:7]
+    return {
+        "ok": True,
+        "local_version": __version__,
+        "local_sha": local_sha,
+        "remote_sha": remote_sha,
+        "update_available": bool(local_sha != remote_sha) if local_sha else True,
+    }
+
+
+def _ai_response(command: str, *, ok: bool, data: dict | None = None, errors: list[str] | None = None, warnings: list[str] | None = None) -> dict:
+    return {
+        "ok": ok,
+        "command": command,
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "data": data or {},
+        "errors": errors or [],
+        "warnings": warnings or [],
+    }
+
+
+def run_ai_command(args) -> dict:
+    command = str(getattr(args, "command", "") or "stats")
+    scope = str(getattr(args, "scope", "all_activity") or "all_activity")
+    limit = int(getattr(args, "limit", 10) or 10)
+    repos = getattr(args, "repos", None)
+    project_values = getattr(args, "projects", None)
+
+    if command == "stats":
+        data = {
+            "repo_snapshot": get_cli_snapshot(scope=scope, repos=repos, limit=limit),
+            "tui_parity": get_cli_tui_parity(scope=scope, limit=limit),
+        }
+        return _ai_response(command, ok=True, data=data)
+
+    if command == "status":
+        data = {
+            "db_stats": get_db_stats(),
+            "config": {
+                "include_dirs": read_config(),
+                "schema_outdated": _schema_outdated(),
+            },
+            "paths": {
+                "data_dir": str(DATA_DIR),
+                "config_file": str(CONFIG_FILE),
+                "db_file": str(DB_FILE),
+            },
+        }
+        return _ai_response(command, ok=True, data=data)
+
+    if command == "projects.list":
+        return _ai_response(command, ok=True, data={"projects": get_project_list()})
+
+    if command == "config.get":
+        include_dirs = read_config()
+        dirs = resolve_dirs(include_dirs)
+        return _ai_response(
+            command,
+            ok=True,
+            data={
+                "include_dirs": include_dirs,
+                "resolved_paths": [str(d) for d in dirs],
+            },
+        )
+
+    if command == "config.set":
+        if not project_values:
+            return _ai_response(command, ok=False, errors=["missing_projects"])
+        dirs, unknown = _extract_paths_from_project_names(project_values)
+        if not dirs:
+            return _ai_response(command, ok=False, errors=["no_valid_projects"], warnings=unknown)
+        dir_names = [d.name for d in dirs]
+        write_config(dir_names)
+        return _ai_response(
+            command,
+            ok=True,
+            data={
+                "include_dirs": dir_names,
+                "resolved_paths": [str(d) for d in dirs],
+            },
+            warnings=unknown,
+        )
+
+    if command == "extract.run":
+        warnings: list[str] = []
+        if project_values:
+            dirs, unknown = _extract_paths_from_project_names(project_values)
+            warnings.extend(unknown)
+        else:
+            dirs = resolve_dirs(read_config())
+        if not dirs:
+            return _ai_response(command, ok=False, errors=["no_project_dirs"], warnings=warnings)
+        try:
+            data = _perform_extraction(
+                dirs,
+                full=bool(getattr(args, "full", False)),
+                enrich=bool(getattr(args, "enrich", False)),
+                scope=scope,  # type: ignore[arg-type]
+                github_token_env=str(getattr(args, "github_token_env", "GITHUB_TOKEN") or "GITHUB_TOKEN"),
+                github_max_prs=int(getattr(args, "github_max_prs", 500) or 500),
+            )
+            return _ai_response(command, ok=True, data=data, warnings=warnings)
+        except Exception as exc:
+            return _ai_response(command, ok=False, errors=[str(exc)], warnings=warnings)
+
+    if command == "update.check":
+        try:
+            return _ai_response(command, ok=True, data=_check_for_update())
+        except Exception as exc:
+            return _ai_response(command, ok=False, errors=[str(exc)])
+
+    if command == "update.apply":
+        try:
+            update_data = _check_for_update()
+        except Exception as exc:
+            return _ai_response(command, ok=False, errors=[str(exc)])
+        if not update_data.get("update_available"):
+            return _ai_response(command, ok=True, data={"update": update_data, "applied": False})
+        proc = Popen(
+            [sys.executable, "-m", "pip", "install", "--upgrade", PACKAGE_URL],
+            stdout=PIPE, stderr=STDOUT, text=True,
+        )
+        stdout, _ = proc.communicate()
+        data = {
+            "update": update_data,
+            "applied": proc.returncode == 0,
+            "returncode": int(proc.returncode or 0),
+            "output_tail": (stdout or "")[-4000:],
+        }
+        return _ai_response(command, ok=proc.returncode == 0, data=data)
+
+    if command == "uninstall":
+        if not bool(getattr(args, "yes", False)):
+            return _ai_response(command, ok=False, errors=["confirmation_required_use_yes"])
+        removed: list[str] = []
+        if CONFIG_FILE.exists():
+            CONFIG_FILE.unlink()
+            removed.append(str(CONFIG_FILE))
+        if bool(getattr(args, "remove_db", False)) and DB_FILE.exists():
+            DB_FILE.unlink()
+            removed.append(str(DB_FILE))
+            for suffix in ("-shm", "-wal"):
+                sib = DB_FILE.parent / (DB_FILE.name + suffix)
+                if sib.exists():
+                    sib.unlink()
+                    removed.append(str(sib))
+        return _ai_response(command, ok=True, data={"removed": removed})
+
+    return _ai_response(command, ok=False, errors=[f"unknown_command:{command}"])
 
 def get_velocity_banner(scope: Scope = "all_activity") -> dict:
     if not DB_FILE.exists():
@@ -1825,18 +2430,27 @@ class DashboardScreen(Screen):
             db.set_meta("sessions_processed", str(stats["processed"]))
             db.set_meta("sessions_skipped", str(stats["skipped"]))
             row = db.conn.execute(
-                "SELECT SUM(CASE WHEN phase='Code' THEN 1 ELSE 0 END), COUNT(*) FROM session_events"
+                """
+                SELECT SUM(CASE WHEN phase='Code' THEN 1 ELSE 0 END), COUNT(*)
+                FROM session_events
+                """
             ).fetchone()
             code_events = int((row[0] if row else 0) or 0)
             all_events = int((row[1] if row else 0) or 0)
             default_code_rate = (code_events / all_events) if all_events else 0.0
             db.set_meta("schema_version", SCHEMA_VERSION)
             db.set_meta("default_code_rate", f"{default_code_rate:.4f}")
-            db.set_meta("github_enrich_errors", "0")
-            prev_enrich = db.conn.execute(
-                "SELECT value FROM extraction_meta WHERE key = 'github_enrich_last_run'"
-            ).fetchone()
-            db.set_meta("github_enrich_last_run", (prev_enrich[0] if prev_enrich else ""))
+            for key in (
+                "github_enrich_last_run",
+                "github_enrich_errors",
+                "github_enrich_commit_last_run",
+                "github_enrich_commit_errors",
+            ):
+                prev = db.conn.execute(
+                    "SELECT value FROM extraction_meta WHERE key = ?",
+                    (key,),
+                ).fetchone()
+                db.set_meta(key, (prev[0] if prev else ""))
             db.commit()
 
             if stats["total"] == 0:
@@ -2028,7 +2642,100 @@ def main() -> None:
         description="SDLC session analytics for Claude Code",
     )
     ap.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
-    ap.parse_args()
+    ap.add_argument(
+        "--cli",
+        action="store_true",
+        help="Legacy alias for AI mode stats output.",
+    )
+    ap.add_argument(
+        "--ai",
+        action="store_true",
+        help="AI mode: non-interactive JSON command interface.",
+    )
+    ap.add_argument(
+        "--scope",
+        choices=("all_activity", "delivery_only"),
+        default="all_activity",
+        help="Scope for --cli output (default: all_activity).",
+    )
+    ap.add_argument(
+        "--repo",
+        action="append",
+        dest="repos",
+        help="Filter --cli output to repository full name (owner/name). Repeat for multiple repos.",
+    )
+    ap.add_argument(
+        "--limit",
+        type=int,
+        default=10,
+        help="Row limit for --cli tables (default: 10).",
+    )
+    ap.add_argument(
+        "--compact",
+        action="store_true",
+        help="Emit compact JSON for AI/CLI output.",
+    )
+    ap.add_argument(
+        "--command",
+        choices=(
+            "stats",
+            "status",
+            "projects.list",
+            "config.get",
+            "config.set",
+            "extract.run",
+            "update.check",
+            "update.apply",
+            "uninstall",
+        ),
+        default="stats",
+        help="AI/CLI command to execute (default: stats).",
+    )
+    ap.add_argument(
+        "--project",
+        action="append",
+        dest="projects",
+        help="Project name/display for config.set or extract.run. Repeat for multiple values.",
+    )
+    ap.add_argument(
+        "--full",
+        action="store_true",
+        help="Use full re-extraction for extract.run.",
+    )
+    ap.add_argument(
+        "--enrich",
+        action="store_true",
+        help="Run GitHub enrichment during extract.run.",
+    )
+    ap.add_argument(
+        "--github-token-env",
+        default="GITHUB_TOKEN",
+        help="Token env var for extract.run --enrich (default: GITHUB_TOKEN).",
+    )
+    ap.add_argument(
+        "--github-max-prs",
+        type=int,
+        default=500,
+        help="Max PR links for extract.run --enrich (default: 500).",
+    )
+    ap.add_argument(
+        "--yes",
+        action="store_true",
+        help="Confirmation flag for destructive commands such as uninstall.",
+    )
+    ap.add_argument(
+        "--remove-db",
+        action="store_true",
+        help="When used with uninstall, also remove the SQLite DB and WAL/SHM files.",
+    )
+    args = ap.parse_args()
+    if args.cli or args.ai:
+        payload = run_ai_command(args)
+        if args.compact:
+            print(json.dumps(payload, separators=(",", ":")))
+        else:
+            print(json.dumps(payload, indent=2))
+        return
     SdlcApp().run()
 
 if __name__ == "__main__":

@@ -34,7 +34,6 @@ def _request_json_any(
     url: str,
     token: str,
     retries: int = 3,
-    verbose: bool = False,
     accept: str = "application/vnd.github+json",
 ) -> Any:
     headers = {
@@ -72,7 +71,6 @@ def _request_paginated(
     url: str,
     token: str,
     retries: int = 3,
-    verbose: bool = False,
     accept: str = "application/vnd.github+json",
     per_page: int = 100,
 ) -> list[dict]:
@@ -85,7 +83,6 @@ def _request_paginated(
             page_url,
             token=token,
             retries=retries,
-            verbose=verbose,
             accept=accept,
         )
         if not isinstance(payload, list):
@@ -101,7 +98,7 @@ def _request_paginated(
 def fetch_pr(owner: str, repo: str, number: int, token: str, verbose: bool = False) -> dict:
     """Fetch one PR from GitHub REST API and normalize fields for `pr_facts`."""
     url = f"https://api.github.com/repos/{owner}/{repo}/pulls/{number}"
-    payload = _request_json_any(url, token=token, verbose=verbose)
+    payload = _request_json_any(url, token=token)
     if not isinstance(payload, dict):
         raise ValueError(f"Unexpected PR payload type for {owner}/{repo}#{number}")
     now_iso = datetime.now(timezone.utc).isoformat()
@@ -126,7 +123,7 @@ def fetch_pr(owner: str, repo: str, number: int, token: str, verbose: bool = Fal
 def fetch_pr_commits(owner: str, repo: str, number: int, token: str, verbose: bool = False) -> list[dict]:
     """Fetch the final commit set attached to a PR."""
     url = f"https://api.github.com/repos/{owner}/{repo}/pulls/{number}/commits"
-    payload = _request_paginated(url, token=token, verbose=verbose)
+    payload = _request_paginated(url, token=token)
     commits: list[dict] = []
     for item in payload:
         sha = item.get("sha")
@@ -157,7 +154,6 @@ def fetch_pr_timeline_committed_events(
     payload = _request_paginated(
         url,
         token=token,
-        verbose=verbose,
         accept=_TIMELINE_ACCEPT,
     )
     events: list[dict] = []
