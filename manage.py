@@ -411,7 +411,6 @@ def _schema_outdated() -> bool:
     v = _get_meta("schema_version")
     return bool(DB_FILE.exists() and v != SCHEMA_VERSION)
 
-
 def _normalize_repo_filters(repos: list[str] | None) -> list[str]:
     if not repos:
         return []
@@ -773,7 +772,14 @@ def _perform_extraction(
         db.set_meta("sessions_processed", str(stats["processed"]))
         db.set_meta("sessions_skipped", str(stats["skipped"]))
         row = db.conn.execute(
-            "SELECT SUM(CASE WHEN phase='Code' THEN 1 ELSE 0 END), COUNT(*) FROM session_events"
+            f"""
+            SELECT
+                SUM(CASE WHEN e.phase='Code' THEN 1 ELSE 0 END),
+                COUNT(*)
+            FROM session_events e
+            JOIN sessions s ON s.session_id = e.session_id
+            WHERE {_scope_clause(scope, 's')}
+            """
         ).fetchone()
         code_events = int((row[0] if row else 0) or 0)
         all_events = int((row[1] if row else 0) or 0)
@@ -2246,7 +2252,7 @@ class StatsScreen(Screen):
         phases = get_session_pipeline(session_id)
         bar = self.query_one("#session-phase-bar", Static)
         table = self.query_one("#session-phase-table", DataTable)
-        table.clear()
+        self._prepare_table(table, ("Phase", "Calls", "Time %", "Top Tools"))
 
         if not phases:
             bar.update("[dim]No events for this session.[/dim]")
@@ -2424,18 +2430,27 @@ class DashboardScreen(Screen):
             db.set_meta("sessions_processed", str(stats["processed"]))
             db.set_meta("sessions_skipped", str(stats["skipped"]))
             row = db.conn.execute(
-                "SELECT SUM(CASE WHEN phase='Code' THEN 1 ELSE 0 END), COUNT(*) FROM session_events"
+                """
+                SELECT SUM(CASE WHEN phase='Code' THEN 1 ELSE 0 END), COUNT(*)
+                FROM session_events
+                """
             ).fetchone()
             code_events = int((row[0] if row else 0) or 0)
             all_events = int((row[1] if row else 0) or 0)
             default_code_rate = (code_events / all_events) if all_events else 0.0
             db.set_meta("schema_version", SCHEMA_VERSION)
             db.set_meta("default_code_rate", f"{default_code_rate:.4f}")
-            db.set_meta("github_enrich_errors", "0")
-            prev_enrich = db.conn.execute(
-                "SELECT value FROM extraction_meta WHERE key = 'github_enrich_last_run'"
-            ).fetchone()
-            db.set_meta("github_enrich_last_run", (prev_enrich[0] if prev_enrich else ""))
+            for key in (
+                "github_enrich_last_run",
+                "github_enrich_errors",
+                "github_enrich_commit_last_run",
+                "github_enrich_commit_errors",
+            ):
+                prev = db.conn.execute(
+                    "SELECT value FROM extraction_meta WHERE key = ?",
+                    (key,),
+                ).fetchone()
+                db.set_meta(key, (prev[0] if prev else ""))
             db.commit()
 
             if stats["total"] == 0:

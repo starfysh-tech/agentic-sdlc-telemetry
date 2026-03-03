@@ -866,8 +866,16 @@ def main():
         elif args.enrich_only and args.verbose:
             print(f"Skipping GitHub enrichment: {token_name} not set", file=sys.stderr)
 
+        scope_clause = "s.is_subagent = 0" if args.scope == "delivery_only" else "1=1"
         row = db.conn.execute(
-            "SELECT SUM(CASE WHEN phase='Code' THEN 1 ELSE 0 END), COUNT(*) FROM session_events"
+            f"""
+            SELECT
+                SUM(CASE WHEN e.phase='Code' THEN 1 ELSE 0 END),
+                COUNT(*)
+            FROM session_events e
+            JOIN sessions s ON s.session_id = e.session_id
+            WHERE {scope_clause}
+            """
         ).fetchone()
         code_events = int(row[0] or 0)
         all_events = int(row[1] or 0)
