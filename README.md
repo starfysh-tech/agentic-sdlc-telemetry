@@ -14,6 +14,12 @@ Or with pip:
 pip install git+https://github.com/starfysh-tech/agentic-sdlc-telemetry
 ```
 
+### Quick-Install Users (No Repo Clone)
+
+If you installed with `pipx`, you do **not** need to clone this repository.
+Run `sdlc-t` from any directory; it reads Claude session data from `~/.claude/projects/`
+and stores analytics in `~/.claude/usage-data/sdlc-analytics/`.
+
 ## Usage
 
 ```bash
@@ -21,6 +27,7 @@ sdlc-t
 ```
 
 Launches an interactive TUI. On first run, use **Configure projects** to select which projects to include.
+You can also do first-time setup entirely from CLI/AI mode (no prior TUI setup required).
 
 The tool is self-contained under `sdlc-t`:
 
@@ -33,6 +40,27 @@ Stats support two scopes:
 - **Delivery Only** — includes only main sessions
 
 Stats now include a **PR Commit Timing** view with pre-vs-post PR-open commit counts, post-open ratio, and confidence bands.
+
+## Quickstart (First Run, No Existing Setup)
+
+Use this flow if you have not configured projects in the TUI yet:
+
+```bash
+# 1) Discover available Claude project directories
+sdlc-t --ai --command projects.list
+
+# 2) Configure one or more projects (copy values from projects.list output)
+sdlc-t --ai --command config.set --project "<project_name_or_display>"
+
+# 3) Run extraction (full on first run, incremental afterward)
+sdlc-t --ai --command extract.run --full
+
+# 4) View stats
+sdlc-t --ai --command stats --scope all_activity --limit 20
+```
+
+If `projects.list` returns no projects, you likely have no session data yet under `~/.claude/projects/`.
+Run Claude Code in at least one repo first, then rerun `projects.list`.
 
 ### AI Command Mode (for automation/AI)
 
@@ -153,11 +181,48 @@ Use enrichment to fill PR lifecycle truth data and PR commit timing truth:
 sdlc-t --ai --command extract.run --enrich --github-token-env GITHUB_TOKEN
 ```
 
+### Token Check and Setup
+
+Check whether the token is present in your current shell:
+
+```bash
+if [ -n "$GITHUB_TOKEN" ]; then echo "GITHUB_TOKEN is set"; else echo "GITHUB_TOKEN is NOT set"; fi
+```
+
+If missing, create a token at [GitHub Personal Access Tokens](https://github.com/settings/personal-access-tokens), then set it:
+
+```bash
+export GITHUB_TOKEN="<your_token>"
+```
+
+Persist it for future `zsh` sessions:
+
+```bash
+echo "export GITHUB_TOKEN=\"<your_token>\"" >> ~/.zshrc
+source ~/.zshrc
+```
+
+Recommended token type/permissions:
+
+- Fine-grained personal access token
+- Repository access: repos you want to analyze
+- Permissions: `Pull requests: Read`, `Issues: Read`, `Metadata: Read`
+
+Optional shortcut if you already use GitHub CLI auth:
+
+```bash
+export GITHUB_TOKEN="$(gh auth token)"
+```
+
 Common backfill flow after schema upgrades:
 
 ```bash
 sdlc-t --ai --command extract.run --full --enrich --github-token-env GITHUB_TOKEN
 ```
+
+If enrichment is skipped, check the JSON response for:
+
+- `reason: "GITHUB_TOKEN_not_set"`
 
 Direct script usage still works, but `sdlc-t` is the preferred self-contained interface.
 
