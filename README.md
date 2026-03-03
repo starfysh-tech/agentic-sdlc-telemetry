@@ -195,7 +195,7 @@ If missing, create a token at [GitHub Personal Access Tokens](https://github.com
 export GITHUB_TOKEN="<your_token>"
 ```
 
-Persist it for future `zsh` sessions:
+Persist it for future shell sessions (e.g., in `~/.bashrc` or `~/.zshrc`):
 
 ```bash
 echo "export GITHUB_TOKEN=\"<your_token>\"" >> ~/.zshrc
