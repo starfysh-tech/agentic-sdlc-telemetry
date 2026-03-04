@@ -19,6 +19,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 SCHEMA_VERSION = "3"
+DEFAULT_GITHUB_TOKEN_ENV = "AGENTIC_SDLC_TELEMETRY_GITHUB_TOKEN"
 
 # ============================================================
 # Database
@@ -780,8 +781,11 @@ def main():
     ap.add_argument("--enrich-only", action="store_true", help="Only sync PR data from GitHub")
     ap.add_argument(
         "--github-token-env",
-        default="GITHUB_TOKEN",
-        help="Environment variable name that contains GitHub token (default: GITHUB_TOKEN)",
+        default=DEFAULT_GITHUB_TOKEN_ENV,
+        help=(
+            "Environment variable name that contains GitHub token "
+            f"(default: {DEFAULT_GITHUB_TOKEN_ENV})"
+        ),
     )
     ap.add_argument(
         "--github-max-prs",

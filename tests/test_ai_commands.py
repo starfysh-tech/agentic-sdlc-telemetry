@@ -16,7 +16,7 @@ def _args(**overrides):
         "projects": None,
         "full": False,
         "enrich": False,
-        "github_token_env": "GITHUB_TOKEN",
+        "github_token_env": "AGENTIC_SDLC_TELEMETRY_GITHUB_TOKEN",
         "github_max_prs": 500,
         "yes": False,
         "remove_db": False,
