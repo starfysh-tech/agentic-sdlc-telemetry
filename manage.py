@@ -47,6 +47,7 @@ EXTRACT_SCRIPT = Path(__file__).parent / "sdlc_extract.py"
 PROJECTS_BASE  = Path.home() / ".claude" / "projects"
 PACKAGE_URL    = "git+https://github.com/starfysh-tech/agentic-sdlc-telemetry.git"
 GITHUB_API_URL = "https://api.github.com/repos/starfysh-tech/agentic-sdlc-telemetry/commits/main"
+DEFAULT_GITHUB_TOKEN_ENV = "AGENTIC_SDLC_TELEMETRY_GITHUB_TOKEN"
 Scope = Literal["all_activity", "delivery_only"]
 
 # ── Config ─────────────────────────────────────────────────
@@ -759,7 +760,7 @@ def _perform_extraction(
     full: bool = False,
     enrich: bool = False,
     scope: Scope = "all_activity",
-    github_token_env: str = "GITHUB_TOKEN",
+    github_token_env: str = DEFAULT_GITHUB_TOKEN_ENV,
     github_max_prs: int = 500,
 ) -> dict:
     DB_FILE.parent.mkdir(parents=True, exist_ok=True)
@@ -963,7 +964,10 @@ def run_ai_command(args) -> dict:
                 full=bool(getattr(args, "full", False)),
                 enrich=bool(getattr(args, "enrich", False)),
                 scope=scope,  # type: ignore[arg-type]
-                github_token_env=str(getattr(args, "github_token_env", "GITHUB_TOKEN") or "GITHUB_TOKEN"),
+                github_token_env=str(
+                    getattr(args, "github_token_env", DEFAULT_GITHUB_TOKEN_ENV)
+                    or DEFAULT_GITHUB_TOKEN_ENV
+                ),
                 github_max_prs=int(getattr(args, "github_max_prs", 500) or 500),
             )
             return _ai_response(command, ok=True, data=data, warnings=warnings)
@@ -2709,8 +2713,11 @@ def main() -> None:
     )
     ap.add_argument(
         "--github-token-env",
-        default="GITHUB_TOKEN",
-        help="Token env var for extract.run --enrich (default: GITHUB_TOKEN).",
+        default=DEFAULT_GITHUB_TOKEN_ENV,
+        help=(
+            "Token env var for extract.run --enrich "
+            f"(default: {DEFAULT_GITHUB_TOKEN_ENV})."
+        ),
     )
     ap.add_argument(
         "--github-max-prs",

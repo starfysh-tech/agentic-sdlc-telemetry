@@ -111,7 +111,7 @@ sdlc-t --ai --command config.set --project my-project --project org/repo
 sdlc-t --ai --command extract.run
 
 # Run full extraction + GitHub enrichment
-sdlc-t --ai --command extract.run --full --enrich --github-token-env GITHUB_TOKEN --github-max-prs 500
+sdlc-t --ai --command extract.run --full --enrich --github-token-env AGENTIC_SDLC_TELEMETRY_GITHUB_TOKEN --github-max-prs 500
 
 # Check/update package
 sdlc-t --ai --command update.check
@@ -178,7 +178,7 @@ Use enrichment to fill PR lifecycle truth data and PR commit timing truth:
 - PR timeline commit-added events (`/issues/{n}/timeline`)
 
 ```bash
-sdlc-t --ai --command extract.run --enrich --github-token-env GITHUB_TOKEN
+sdlc-t --ai --command extract.run --enrich --github-token-env AGENTIC_SDLC_TELEMETRY_GITHUB_TOKEN
 ```
 
 ### Token Check and Setup
@@ -186,19 +186,19 @@ sdlc-t --ai --command extract.run --enrich --github-token-env GITHUB_TOKEN
 Check whether the token is present in your current shell:
 
 ```bash
-if [ -n "$GITHUB_TOKEN" ]; then echo "GITHUB_TOKEN is set"; else echo "GITHUB_TOKEN is NOT set"; fi
+if [ -n "$AGENTIC_SDLC_TELEMETRY_GITHUB_TOKEN" ]; then echo "AGENTIC_SDLC_TELEMETRY_GITHUB_TOKEN is set"; else echo "AGENTIC_SDLC_TELEMETRY_GITHUB_TOKEN is NOT set"; fi
 ```
 
 If missing, create a token at [GitHub Personal Access Tokens](https://github.com/settings/personal-access-tokens), then set it:
 
 ```bash
-export GITHUB_TOKEN="<your_token>"
+export AGENTIC_SDLC_TELEMETRY_GITHUB_TOKEN="<your_token>"
 ```
 
 Persist it for future `zsh` sessions:
 
 ```bash
-echo "export GITHUB_TOKEN=\"<your_token>\"" >> ~/.zshrc
+echo "export AGENTIC_SDLC_TELEMETRY_GITHUB_TOKEN=\"<your_token>\"" >> ~/.zshrc
 source ~/.zshrc
 ```
 
@@ -211,18 +211,18 @@ Recommended token type/permissions:
 Optional shortcut if you already use GitHub CLI auth:
 
 ```bash
-export GITHUB_TOKEN="$(gh auth token)"
+export AGENTIC_SDLC_TELEMETRY_GITHUB_TOKEN="$(gh auth token)"
 ```
 
 Common backfill flow after schema upgrades:
 
 ```bash
-sdlc-t --ai --command extract.run --full --enrich --github-token-env GITHUB_TOKEN
+sdlc-t --ai --command extract.run --full --enrich --github-token-env AGENTIC_SDLC_TELEMETRY_GITHUB_TOKEN
 ```
 
 If enrichment is skipped, check the JSON response for:
 
-- `reason: "GITHUB_TOKEN_not_set"`
+- `reason: "AGENTIC_SDLC_TELEMETRY_GITHUB_TOKEN_not_set"`
 
 Direct script usage still works, but `sdlc-t` is the preferred self-contained interface.
 
