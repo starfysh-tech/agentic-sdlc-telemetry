@@ -195,7 +195,7 @@ If missing, create a token at [GitHub Personal Access Tokens](https://github.com
 export AGENTIC_SDLC_TELEMETRY_GITHUB_TOKEN="<your_token>"
 ```
 
-Persist it for future `zsh` sessions:
+Persist it for future shell sessions (e.g., for `zsh`):
 
 ```bash
 echo "export AGENTIC_SDLC_TELEMETRY_GITHUB_TOKEN=\"<your_token>\"" >> ~/.zshrc
