@@ -964,10 +964,7 @@ def run_ai_command(args) -> dict:
                 full=bool(getattr(args, "full", False)),
                 enrich=bool(getattr(args, "enrich", False)),
                 scope=scope,  # type: ignore[arg-type]
-                github_token_env=str(
-                    getattr(args, "github_token_env", DEFAULT_GITHUB_TOKEN_ENV)
-                    or DEFAULT_GITHUB_TOKEN_ENV
-                ),
+                github_token_env=str(args.github_token_env or DEFAULT_GITHUB_TOKEN_ENV),
                 github_max_prs=int(getattr(args, "github_max_prs", 500) or 500),
             )
             return _ai_response(command, ok=True, data=data, warnings=warnings)
