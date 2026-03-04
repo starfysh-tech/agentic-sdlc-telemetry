@@ -11,8 +11,5 @@ Audience: developer + team/leadership.
 - DB: `~/.claude/usage-data/sdlc-analytics/sdlc_analytics.db`
 
 ## Development rules
-- During code changes, add discovered enhancements to `todo.md` instead of implementing them
-  - "Parking Lot" section: ideas and out-of-scope improvements
-  - "Prioritized" section: approved items queued for implementation
-- Stay focused on the current task — defer scope creep to todo.md
+- Discoveries outside the current task go to `todo.md`, not into the code. Add a one-line description under the appropriate section (Backlog for ideas, Prioritized for approved work). Do not implement without approval.
 - No new dependencies without discussion — stdlib preferred
